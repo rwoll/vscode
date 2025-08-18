@@ -56,14 +56,16 @@ import { IChatEditingSession, ModifiedFileEntryState } from '../../common/chatEd
 import { ChatEntitlement, IChatEntitlementService } from '../../common/chatEntitlementService.js';
 import { ChatMode, IChatMode, IChatModeService } from '../../common/chatModes.js';
 import { extractAgentAndCommand } from '../../common/chatParserTypes.js';
-import { IChatDetail, IChatService } from '../../common/chatService.js';
+import { IChatDetail, IChatService, IChatSendRequestOptions as IChatServiceSendRequestOptions } from '../../common/chatService.js';
 import { IChatSessionItem, IChatSessionsService } from '../../common/chatSessionsService.js';
 import { ChatSessionUri } from '../../common/chatUri.js';
+import { IChatRequestVariableEntry } from '../../common/chatVariableEntries.js';
 import { IChatRequestViewModel, IChatResponseViewModel, isRequestVM } from '../../common/chatViewModel.js';
 import { IChatWidgetHistoryService } from '../../common/chatWidgetHistoryService.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { CopilotUsageExtensionFeatureId } from '../../common/languageModelStats.js';
 import { ILanguageModelToolsService } from '../../common/languageModelToolsService.js';
+import { IChatRequestModeInfo } from '../../common/chatModel.js';
 import { ChatViewId, IChatWidget, IChatWidgetService, showChatView, showCopilotView } from '../chat.js';
 import { IChatEditorOptions } from '../chatEditor.js';
 import { ChatEditorInput, shouldShowClearEditingSessionConfirmation, showClearEditingSessionConfirmation } from '../chatEditorInput.js';
@@ -78,6 +80,7 @@ export const ACTION_ID_NEW_CHAT = `workbench.action.chat.newChat`;
 export const ACTION_ID_NEW_EDIT_SESSION = `workbench.action.chat.newEditSession`;
 export const CHAT_OPEN_ACTION_ID = 'workbench.action.chat.open';
 export const CHAT_SETUP_ACTION_ID = 'workbench.action.chat.triggerSetup';
+export const SEND_REQUEST_ACTION_ID = 'workbench.action.sendRequest';
 const TOGGLE_CHAT_ACTION_ID = 'workbench.action.chat.toggle';
 const CHAT_CLEAR_HISTORY_ACTION_ID = 'workbench.action.chat.clearHistory';
 
@@ -115,6 +118,68 @@ export interface IChatViewOpenOptions {
 export interface IChatViewOpenRequestEntry {
 	request: string;
 	response: string;
+}
+
+export interface IChatSendRequestOptions {
+	/**
+	 * The query for chat.
+	 */
+	query: string;
+	/**
+	 * A list of tools IDs with `canBeReferencedInPrompt` that will be resolved and attached if they exist.
+	 */
+	toolIds?: string[];
+	/**
+	 * Any previous chat requests and responses that should be shown in the chat view.
+	 */
+	previousRequests?: IChatViewOpenRequestEntry[];
+	/**
+	 * Whether a screenshot of the focused window should be taken and attached
+	 */
+	attachScreenshot?: boolean;
+	/**
+	 * A list of file URIs to attach to the chat as context.
+	 */
+	attachFiles?: URI[];
+	/**
+	 * The mode ID or name to open the chat in.
+	 */
+	mode?: ChatModeKind | string;
+	/**
+	 * The target agent ID can be specified with this property instead of using @ in the query
+	 */
+	agentId?: string;
+	/**
+	 * Slash command to use
+	 */
+	slashCommand?: string;
+}
+
+export interface IChatSendRequestResult {
+	/**
+	 * Whether the request completed successfully
+	 */
+	success: boolean;
+	/**
+	 * Error message if the request failed
+	 */
+	errorMessage?: string;
+	/**
+	 * Whether the error was due to a rate limit being exceeded
+	 */
+	isRateLimited?: boolean;
+	/**
+	 * Whether the response was filtered/incomplete
+	 */
+	isFiltered?: boolean;
+	/**
+	 * The session ID where the request was sent
+	 */
+	sessionId: string;
+	/**
+	 * The request ID that was created
+	 */
+	requestId?: string;
 }
 
 export const CHAT_CONFIG_MENU_ID = new MenuId('workbench.chat.menu.config');
@@ -280,8 +345,172 @@ abstract class ModeOpenChatGlobalAction extends OpenChatGlobalAction {
 	}
 }
 
+class SendRequestAction extends Action2 {
+	constructor() {
+		super({
+			id: SEND_REQUEST_ACTION_ID,
+			title: localize2('sendRequest', "Send Request"),
+			category: CHAT_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.and(
+				ChatContextKeys.Setup.hidden.negate(),
+				ChatContextKeys.Setup.disabled.negate()
+			)
+		});
+	}
+
+	override async run(accessor: ServicesAccessor, opts?: string | IChatSendRequestOptions): Promise<IChatSendRequestResult> {
+		opts = typeof opts === 'string' ? { query: opts } : opts;
+
+		if (!opts?.query) {
+			return {
+				success: false,
+				errorMessage: 'No query provided',
+				sessionId: ''
+			};
+		}
+
+		const chatService = accessor.get(IChatService);
+		const viewsService = accessor.get(IViewsService);
+		const hostService = accessor.get(IHostService);
+		const chatAgentService = accessor.get(IChatAgentService);
+		const chatModeService = accessor.get(IChatModeService);
+		const fileService = accessor.get(IFileService);
+
+		try {
+			// Create a new chat session for this request
+			const location = ChatAgentLocation.Panel;
+			const model = chatService.startSession(location, CancellationToken.None);
+			const sessionId = model.sessionId;
+
+			// Set up the request options
+			const sendOptions: IChatServiceSendRequestOptions = {
+				location,
+				agentId: opts.agentId,
+				slashCommand: opts.slashCommand
+			};
+
+			// Add mode if specified
+			if (opts.mode) {
+				const modeToUse = chatModeService.findModeByName(opts.mode);
+				if (modeToUse) {
+					sendOptions.modeInfo = {
+						kind: modeToUse.kind,
+						isBuiltin: true,
+						instructions: undefined
+					};
+				}
+			}
+
+			// Handle previous requests if provided
+			if (opts.previousRequests?.length) {
+				for (const { request, response } of opts.previousRequests) {
+					chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
+				}
+			}
+
+			// Handle attachments
+			const attachedContext: IChatRequestVariableEntry[] = [];
+
+			// Attach screenshot if requested
+			if (opts.attachScreenshot) {
+				const screenshot = await hostService.getScreenshot();
+				if (screenshot) {
+					attachedContext.push(convertBufferToScreenshotVariable(screenshot));
+				}
+			}
+
+			// Attach files if requested
+			if (opts.attachFiles) {
+				for (const file of opts.attachFiles) {
+					if (await fileService.exists(file)) {
+						attachedContext.push({
+							id: 'file',
+							name: file.path,
+							fullName: file.toString(),
+							value: file,
+							kind: 'file'
+						});
+					}
+				}
+			}
+
+			// Attach tools if requested
+			if (opts.toolIds && opts.toolIds.length > 0) {
+				const toolsService = accessor.get(ILanguageModelToolsService);
+				for (const toolId of opts.toolIds) {
+					const tool = toolsService.getTool(toolId);
+					if (tool) {
+						attachedContext.push({
+							id: tool.id,
+							name: tool.displayName,
+							fullName: tool.displayName,
+							value: undefined,
+							icon: ThemeIcon.isThemeIcon(tool.icon) ? tool.icon : undefined,
+							kind: 'tool'
+						});
+					}
+				}
+			}
+
+			if (attachedContext.length > 0) {
+				sendOptions.attachedContext = attachedContext;
+			}
+
+			// Wait for default agent to be available
+			await waitForDefaultAgent(chatAgentService, sendOptions.modeInfo?.kind ?? ChatModeKind.Ask);
+
+			// Send the request
+			const response = await chatService.sendRequest(sessionId, opts.query, sendOptions);
+
+			if (!response) {
+				return {
+					success: false,
+					errorMessage: 'Failed to send request',
+					sessionId
+				};
+			}
+
+			// Wait for the response to complete
+			await response.responseCompletePromise;
+
+			// Get the response model to check for errors
+			const responseModel = await response.responseCreatedPromise;
+			const result = responseModel.result;
+
+			// Check for various error conditions
+			if (result?.errorDetails) {
+				const errorDetails = result.errorDetails;
+				return {
+					success: false,
+					errorMessage: errorDetails.message,
+					isRateLimited: errorDetails.isQuotaExceeded,
+					isFiltered: errorDetails.responseIsFiltered || errorDetails.responseIsRedacted,
+					sessionId,
+					requestId: responseModel.requestId
+				};
+			}
+
+			// Success case
+			return {
+				success: true,
+				sessionId,
+				requestId: responseModel.requestId
+			};
+
+		} catch (error) {
+			return {
+				success: false,
+				errorMessage: error instanceof Error ? error.message : String(error),
+				sessionId: ''
+			};
+		}
+	}
+}
+
 export function registerChatActions() {
 	registerAction2(PrimaryOpenChatGlobalAction);
+	registerAction2(SendRequestAction);
 	registerAction2(class extends ModeOpenChatGlobalAction {
 		constructor() { super(ChatMode.Ask); }
 	});
