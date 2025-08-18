@@ -16,6 +16,7 @@ import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { Disposable, DisposableStore, markAsSingleton } from '../../../../../base/common/lifecycle.js';
 import { MarshalledId } from '../../../../../base/common/marshallingIds.js';
 import { language } from '../../../../../base/common/platform.js';
+import { basename } from '../../../../../base/common/resources.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ICodeEditor } from '../../../../../editor/browser/editorBrowser.js';
@@ -383,6 +384,13 @@ class SendRequestAction extends Action2 {
 			const model = chatService.startSession(location, CancellationToken.None);
 			const sessionId = model.sessionId;
 
+			// Handle previous requests if provided
+			if (opts.previousRequests?.length) {
+				for (const { request, response } of opts.previousRequests) {
+					await chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
+				}
+			}
+
 			// Set up the request options
 			const sendOptions: IChatServiceSendRequestOptions = {
 				location,
@@ -402,13 +410,6 @@ class SendRequestAction extends Action2 {
 				}
 			}
 
-			// Handle previous requests if provided
-			if (opts.previousRequests?.length) {
-				for (const { request, response } of opts.previousRequests) {
-					chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
-				}
-			}
-
 			// Handle attachments
 			const attachedContext: IChatRequestVariableEntry[] = [];
 
@@ -425,8 +426,8 @@ class SendRequestAction extends Action2 {
 				for (const file of opts.attachFiles) {
 					if (await fileService.exists(file)) {
 						attachedContext.push({
-							id: 'file',
-							name: file.path,
+							id: 'vscode.file',
+							name: basename(file),
 							fullName: file.toString(),
 							value: file,
 							kind: 'file'
