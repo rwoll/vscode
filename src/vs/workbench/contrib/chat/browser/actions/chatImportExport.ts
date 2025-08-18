@@ -5,6 +5,7 @@
 
 import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { joinPath } from '../../../../../base/common/resources.js';
+import { URI } from '../../../../../base/common/uri.js';
 import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
 import { localize, localize2 } from '../../../../../nls.js';
 import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
@@ -44,13 +45,35 @@ export function registerChatExportActions() {
 				return;
 			}
 
-			const defaultUri = joinPath(await fileDialogService.defaultFilePath(), defaultFileName);
-			const result = await fileDialogService.showSaveDialog({
-				defaultUri,
-				filters
-			});
-			if (!result) {
-				return;
+			// Check if a file path was provided as an argument
+			let targetUri: URI | undefined;
+			const firstArg = args[0];
+			
+			if (firstArg) {
+				if (URI.isUri(firstArg)) {
+					targetUri = firstArg;
+				} else if (typeof firstArg === 'string') {
+					// Convert string path to URI
+					try {
+						targetUri = URI.file(firstArg);
+					} catch (error) {
+						// Invalid path provided, fall back to dialog
+						targetUri = undefined;
+					}
+				}
+			}
+
+			// If no valid file path was provided, show the save dialog
+			if (!targetUri) {
+				const defaultUri = joinPath(await fileDialogService.defaultFilePath(), defaultFileName);
+				const result = await fileDialogService.showSaveDialog({
+					defaultUri,
+					filters
+				});
+				if (!result) {
+					return;
+				}
+				targetUri = result;
 			}
 
 			const model = chatService.getSession(widget.viewModel.sessionId);
@@ -60,7 +83,7 @@ export function registerChatExportActions() {
 
 			// Using toJSON on the model
 			const content = VSBuffer.fromString(JSON.stringify(model.toExport(), undefined, 2));
-			await fileService.writeFile(result, content);
+			await fileService.writeFile(targetUri, content);
 		}
 	});
 
