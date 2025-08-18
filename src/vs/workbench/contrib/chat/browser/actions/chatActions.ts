@@ -217,73 +217,44 @@ abstract class OpenChatGlobalAction extends Action2 {
 	override async run(accessor: ServicesAccessor, opts?: string | IChatViewOpenOptions): Promise<void> {
 		opts = typeof opts === 'string' ? { query: opts } : opts;
 
-		const chatService = accessor.get(IChatService);
+		const services = getChatActionServices(accessor);
 		const widgetService = accessor.get(IChatWidgetService);
 		const toolsService = accessor.get(ILanguageModelToolsService);
-		const viewsService = accessor.get(IViewsService);
-		const hostService = accessor.get(IHostService);
-		const chatAgentService = accessor.get(IChatAgentService);
 		const instaService = accessor.get(IInstantiationService);
 		const commandService = accessor.get(ICommandService);
-		const chatModeService = accessor.get(IChatModeService);
-		const fileService = accessor.get(IFileService);
 
 		let chatWidget = widgetService.lastFocusedWidget;
 		// When this was invoked to switch to a mode via keybinding, and some chat widget is focused, use that one.
 		// Otherwise, open the view.
 		if (!this.mode || !chatWidget || !isAncestorOfActiveElement(chatWidget.domNode)) {
-			chatWidget = await showChatView(viewsService);
+			chatWidget = await showChatView(services.viewsService);
 		}
 
 		if (!chatWidget) {
 			return;
 		}
 
-		const switchToMode = (opts?.mode ? chatModeService.findModeByName(opts?.mode) : undefined) ?? this.mode;
+		const switchToMode = (opts?.mode ? services.chatModeService.findModeByName(opts?.mode) : undefined) ?? this.mode;
 		if (switchToMode) {
 			await this.handleSwitchToMode(switchToMode, chatWidget, instaService, commandService);
 		}
 
 		if (opts?.previousRequests?.length && chatWidget.viewModel) {
 			for (const { request, response } of opts.previousRequests) {
-				chatService.addCompleteRequest(chatWidget.viewModel.sessionId, request, undefined, 0, { message: response });
+				services.chatService.addCompleteRequest(chatWidget.viewModel.sessionId, request, undefined, 0, { message: response });
 			}
 		}
-		if (opts?.attachScreenshot) {
-			const screenshot = await hostService.getScreenshot();
-			if (screenshot) {
-				chatWidget.attachmentModel.addContext(convertBufferToScreenshotVariable(screenshot));
-			}
-		}
-		if (opts?.attachFiles) {
-			for (const file of opts.attachFiles) {
-				if (await fileService.exists(file)) {
-					chatWidget.attachmentModel.addFile(file);
-				}
-			}
-		}
+		
+		// Apply attachments using shared utility
+		await applyChatAttachmentsToWidget(opts, chatWidget, services, toolsService);
+		
 		if (opts?.query) {
 			if (opts.isPartialQuery) {
 				chatWidget.setInput(opts.query);
 			} else {
 				await chatWidget.waitForReady();
-				await waitForDefaultAgent(chatAgentService, chatWidget.input.currentModeKind);
+				await waitForDefaultAgent(services.chatAgentService, chatWidget.input.currentModeKind);
 				chatWidget.acceptInput(opts.query);
-			}
-		}
-		if (opts?.toolIds && opts.toolIds.length > 0) {
-			for (const toolId of opts.toolIds) {
-				const tool = toolsService.getTool(toolId);
-				if (tool) {
-					chatWidget.attachmentModel.addContext({
-						id: tool.id,
-						name: tool.displayName,
-						fullName: tool.displayName,
-						value: undefined,
-						icon: ThemeIcon.isThemeIcon(tool.icon) ? tool.icon : undefined,
-						kind: 'tool'
-					});
-				}
 			}
 		}
 
@@ -384,12 +355,8 @@ class SendRequestAction extends Action2 {
 			};
 		}
 
-		const chatService = accessor.get(IChatService);
-		const viewsService = accessor.get(IViewsService);
-		const hostService = accessor.get(IHostService);
-		const chatAgentService = accessor.get(IChatAgentService);
-		const chatModeService = accessor.get(IChatModeService);
-		const fileService = accessor.get(IFileService);
+		const services = getChatActionServices(accessor);
+		const toolsService = accessor.get(ILanguageModelToolsService);
 
 		try {
 			let sessionId: string;
@@ -397,27 +364,27 @@ class SendRequestAction extends Action2 {
 
 			// Use existing session if provided, otherwise create a new one
 			if (opts.sessionId) {
-				const existingModel = chatService.getSession(opts.sessionId);
+				const existingModel = services.chatService.getSession(opts.sessionId);
 				if (existingModel) {
 					model = existingModel;
 					sessionId = opts.sessionId;
 				} else {
 					// Session not found, create a new one
 					const location = ChatAgentLocation.Panel;
-					model = chatService.startSession(location, CancellationToken.None);
+					model = services.chatService.startSession(location, CancellationToken.None);
 					sessionId = model.sessionId;
 				}
 			} else {
 				// Create a new chat session for this request
 				const location = ChatAgentLocation.Panel;
-				model = chatService.startSession(location, CancellationToken.None);
+				model = services.chatService.startSession(location, CancellationToken.None);
 				sessionId = model.sessionId;
 			}
 
 			// Handle previous requests if provided (only for new sessions)
 			if (!opts.sessionId && opts.previousRequests?.length) {
 				for (const { request, response } of opts.previousRequests) {
-					await chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
+					await services.chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
 				}
 			}
 
@@ -431,7 +398,7 @@ class SendRequestAction extends Action2 {
 
 			// Add mode if specified
 			if (opts.mode) {
-				const modeToUse = chatModeService.findModeByName(opts.mode);
+				const modeToUse = services.chatModeService.findModeByName(opts.mode);
 				if (modeToUse) {
 					sendOptions.modeInfo = {
 						kind: modeToUse.kind,
@@ -441,59 +408,18 @@ class SendRequestAction extends Action2 {
 				}
 			}
 
-			// Handle attachments
-			const attachedContext: IChatRequestVariableEntry[] = [];
-
-			// Attach screenshot if requested
-			if (opts.attachScreenshot) {
-				const screenshot = await hostService.getScreenshot();
-				if (screenshot) {
-					attachedContext.push(convertBufferToScreenshotVariable(screenshot));
-				}
-			}
-
-			// Attach files if requested
-			if (opts.attachFiles) {
-				for (const file of opts.attachFiles) {
-					if (await fileService.exists(file)) {
-						attachedContext.push({
-							id: 'vscode.file',
-							name: basename(file),
-							fullName: file.toString(),
-							value: file,
-							kind: 'file'
-						});
-					}
-				}
-			}
-
-			// Attach tools if requested
-			if (opts.toolIds && opts.toolIds.length > 0) {
-				const toolsService = accessor.get(ILanguageModelToolsService);
-				for (const toolId of opts.toolIds) {
-					const tool = toolsService.getTool(toolId);
-					if (tool) {
-						attachedContext.push({
-							id: tool.id,
-							name: tool.displayName,
-							fullName: tool.displayName,
-							value: undefined,
-							icon: ThemeIcon.isThemeIcon(tool.icon) ? tool.icon : undefined,
-							kind: 'tool'
-						});
-					}
-				}
-			}
+			// Handle attachments using shared utility
+			const attachedContext = await prepareChatAttachments(opts, services, toolsService);
 
 			if (attachedContext.length > 0) {
 				sendOptions.attachedContext = attachedContext;
 			}
 
 			// Wait for default agent to be available
-			await waitForDefaultAgent(chatAgentService, sendOptions.modeInfo?.kind ?? ChatModeKind.Ask);
+			await waitForDefaultAgent(services.chatAgentService, sendOptions.modeInfo?.kind ?? ChatModeKind.Ask);
 
 			// Send the request
-			const response = await chatService.sendRequest(sessionId, opts.query, sendOptions);
+			const response = await services.chatService.sendRequest(sessionId, opts.query, sendOptions);
 
 			if (!response) {
 				return {
@@ -564,6 +490,125 @@ class SendRequestAction extends Action2 {
 				errorMessage: error instanceof Error ? error.message : String(error),
 				sessionId: ''
 			};
+		}
+	}
+}
+
+// Shared utility functions to reduce code duplication between chat actions
+
+interface IChatActionServices {
+	chatService: IChatService;
+	viewsService: IViewsService;
+	hostService: IHostService;
+	chatAgentService: IChatAgentService;
+	chatModeService: IChatModeService;
+	fileService: IFileService;
+}
+
+function getChatActionServices(accessor: ServicesAccessor): IChatActionServices {
+	return {
+		chatService: accessor.get(IChatService),
+		viewsService: accessor.get(IViewsService),
+		hostService: accessor.get(IHostService),
+		chatAgentService: accessor.get(IChatAgentService),
+		chatModeService: accessor.get(IChatModeService),
+		fileService: accessor.get(IFileService)
+	};
+}
+
+interface IChatAttachmentOptions {
+	attachScreenshot?: boolean;
+	attachFiles?: URI[];
+	toolIds?: string[];
+}
+
+async function prepareChatAttachments(
+	options: IChatAttachmentOptions, 
+	services: IChatActionServices,
+	toolsService: ILanguageModelToolsService
+): Promise<IChatRequestVariableEntry[]> {
+	const attachedContext: IChatRequestVariableEntry[] = [];
+
+	// Attach screenshot if requested
+	if (options.attachScreenshot) {
+		const screenshot = await services.hostService.getScreenshot();
+		if (screenshot) {
+			attachedContext.push(convertBufferToScreenshotVariable(screenshot));
+		}
+	}
+
+	// Attach files if requested
+	if (options.attachFiles) {
+		for (const file of options.attachFiles) {
+			if (await services.fileService.exists(file)) {
+				attachedContext.push({
+					id: 'vscode.file',
+					name: basename(file),
+					fullName: file.toString(),
+					value: file,
+					kind: 'file'
+				});
+			}
+		}
+	}
+
+	// Attach tools if requested
+	if (options.toolIds && options.toolIds.length > 0) {
+		for (const toolId of options.toolIds) {
+			const tool = toolsService.getTool(toolId);
+			if (tool) {
+				attachedContext.push({
+					id: tool.id,
+					name: tool.displayName,
+					fullName: tool.displayName,
+					value: undefined,
+					icon: ThemeIcon.isThemeIcon(tool.icon) ? tool.icon : undefined,
+					kind: 'tool'
+				});
+			}
+		}
+	}
+
+	return attachedContext;
+}
+
+async function applyChatAttachmentsToWidget(
+	options: IChatAttachmentOptions,
+	chatWidget: IChatWidget,
+	services: IChatActionServices,
+	toolsService: ILanguageModelToolsService
+): Promise<void> {
+	// Apply screenshot attachment
+	if (options.attachScreenshot) {
+		const screenshot = await services.hostService.getScreenshot();
+		if (screenshot) {
+			chatWidget.attachmentModel.addContext(convertBufferToScreenshotVariable(screenshot));
+		}
+	}
+
+	// Apply file attachments
+	if (options.attachFiles) {
+		for (const file of options.attachFiles) {
+			if (await services.fileService.exists(file)) {
+				chatWidget.attachmentModel.addFile(file);
+			}
+		}
+	}
+
+	// Apply tool attachments
+	if (options.toolIds && options.toolIds.length > 0) {
+		for (const toolId of options.toolIds) {
+			const tool = toolsService.getTool(toolId);
+			if (tool) {
+				chatWidget.attachmentModel.addContext({
+					id: tool.id,
+					name: tool.displayName,
+					fullName: tool.displayName,
+					value: undefined,
+					icon: ThemeIcon.isThemeIcon(tool.icon) ? tool.icon : undefined,
+					kind: 'tool'
+				});
+			}
 		}
 	}
 }
