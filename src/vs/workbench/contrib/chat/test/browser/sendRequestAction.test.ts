@@ -134,6 +134,48 @@ suite('SendRequestAction', () => {
 		};
 		testDisposables.add(chatAgentService.registerAgent('testAgent', { ...getAgentData('testAgent'), isDefault: true }));
 		testDisposables.add(chatAgentService.registerAgentImplementation('testAgent', agent));
+
+		// Register a rate-limited agent for testing error scenarios
+		const rateLimitedAgent: IChatAgentImplementation = {
+			async invoke(request, progress, history, token) {
+				return {
+					errorDetails: {
+						message: 'Rate limit exceeded. Please retry after 120 seconds.',
+						isQuotaExceeded: true
+					}
+				};
+			},
+		};
+		testDisposables.add(chatAgentService.registerAgent('rateLimitedAgent', getAgentData('rateLimitedAgent')));
+		testDisposables.add(chatAgentService.registerAgentImplementation('rateLimitedAgent', rateLimitedAgent));
+
+		// Register an agent that returns rate limit error with different timing format
+		const rateLimitedAgent2: IChatAgentImplementation = {
+			async invoke(request, progress, history, token) {
+				return {
+					errorDetails: {
+						message: 'Too many requests. Try again in 5 minutes.',
+						isQuotaExceeded: true
+					}
+				};
+			},
+		};
+		testDisposables.add(chatAgentService.registerAgent('rateLimitedAgent2', getAgentData('rateLimitedAgent2')));
+		testDisposables.add(chatAgentService.registerAgentImplementation('rateLimitedAgent2', rateLimitedAgent2));
+
+		// Register an agent that returns rate limit error without specific timing
+		const rateLimitedAgent3: IChatAgentImplementation = {
+			async invoke(request, progress, history, token) {
+				return {
+					errorDetails: {
+						message: 'Rate limit exceeded.',
+						isQuotaExceeded: true
+					}
+				};
+			},
+		};
+		testDisposables.add(chatAgentService.registerAgent('rateLimitedAgent3', getAgentData('rateLimitedAgent3')));
+		testDisposables.add(chatAgentService.registerAgentImplementation('rateLimitedAgent3', rateLimitedAgent3));
 		
 		// Register chat actions to make SendRequestAction available
 		registerChatActions();
@@ -180,5 +222,120 @@ suite('SendRequestAction', () => {
 		
 		assert.strictEqual(typeof result, 'object');
 		assert.strictEqual(typeof result.success, 'boolean');
+	});
+
+	test('sendRequest with sessionId reuses existing session', async () => {
+		// First create a session
+		const firstResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'first request' 
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(firstResult.success, true);
+		assert.notEqual(firstResult.sessionId, '');
+		
+		// Now reuse that session
+		const secondResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'second request',
+			sessionId: firstResult.sessionId
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(secondResult.success, true);
+		assert.strictEqual(secondResult.sessionId, firstResult.sessionId);
+	});
+
+	test('sendRequest with invalid sessionId creates new session', async () => {
+		const result = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'test request',
+			sessionId: 'invalid-session-id'
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(result.success, true);
+		assert.notEqual(result.sessionId, 'invalid-session-id');
+		assert.notEqual(result.sessionId, '');
+	});
+
+	test('sendRequest with sessionId does not add previousRequests', async () => {
+		// First create a session
+		const firstResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'first request' 
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(firstResult.success, true);
+		
+		// Reuse session and ensure previousRequests are ignored (not added twice)
+		const secondResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'second request',
+			sessionId: firstResult.sessionId,
+			previousRequests: [{ request: 'should be ignored', response: 'should be ignored' }]
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(secondResult.success, true);
+		assert.strictEqual(secondResult.sessionId, firstResult.sessionId);
+	});
+
+	test('sendRequest handles rate limit with retry timing in seconds', async () => {
+		const result = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'test request',
+			agentId: 'rateLimitedAgent'
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(result.success, false);
+		assert.strictEqual(result.isRateLimited, true);
+		assert.strictEqual(result.retryAfterSeconds, 120);
+		assert.ok(result.retryAfterDate instanceof Date);
+		assert.ok(result.retryAfterDate.getTime() > Date.now());
+		assert.ok(result.errorMessage?.includes('Rate limit exceeded'));
+	});
+
+	test('sendRequest handles rate limit with retry timing in minutes', async () => {
+		const result = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'test request',
+			agentId: 'rateLimitedAgent2'
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(result.success, false);
+		assert.strictEqual(result.isRateLimited, true);
+		assert.strictEqual(result.retryAfterSeconds, 300); // 5 minutes = 300 seconds
+		assert.ok(result.retryAfterDate instanceof Date);
+		assert.ok(result.retryAfterDate.getTime() > Date.now());
+		assert.ok(result.errorMessage?.includes('Try again in 5 minutes'));
+	});
+
+	test('sendRequest handles rate limit with default retry timing when not specified', async () => {
+		const result = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'test request',
+			agentId: 'rateLimitedAgent3'
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(result.success, false);
+		assert.strictEqual(result.isRateLimited, true);
+		assert.strictEqual(result.retryAfterSeconds, 60); // Default 60 seconds
+		assert.ok(result.retryAfterDate instanceof Date);
+		assert.ok(result.retryAfterDate.getTime() > Date.now());
+		assert.ok(result.errorMessage?.includes('Rate limit exceeded'));
+	});
+
+	test('sendRequest retry timing works with session resumption', async () => {
+		// First request fails with rate limit
+		const firstResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'first request',
+			agentId: 'rateLimitedAgent'
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(firstResult.success, false);
+		assert.strictEqual(firstResult.isRateLimited, true);
+		assert.notEqual(firstResult.sessionId, '');
+		
+		// Retry with same session after rate limit
+		const retryResult = await commandService.executeCommand(SEND_REQUEST_ACTION_ID, { 
+			query: 'retry request',
+			sessionId: firstResult.sessionId,
+			agentId: 'testAgent' // Use successful agent for retry
+		}) as IChatSendRequestResult;
+		
+		assert.strictEqual(retryResult.success, true);
+		assert.strictEqual(retryResult.sessionId, firstResult.sessionId);
+		assert.strictEqual(retryResult.isRateLimited, undefined);
+		assert.strictEqual(retryResult.retryAfterSeconds, undefined);
 	});
 });
