@@ -92,51 +92,6 @@ suite('Chat Import/Export Actions', () => {
 		instantiationService.stub(ICommandService, mockCommandService);
 	});
 
-	test('export chat with file path provided as URI', async () => {
-		// Register the actions
-		registerChatExportActions();
-
-		// Get the export action
-		const actions = instantiationService.invokeFunction(accessor => {
-			return accessor.get(ICommandService);
-		});
-
-		// Create a target URI
-		const targetUri = URI.file('/test/export/path/my-chat.json');
-
-		// Execute the export action with URI argument
-		await instantiationService.invokeFunction(async (accessor) => {
-			const widgetService = accessor.get(IChatWidgetService);
-			const fileService = accessor.get(IFileService);
-			const chatService = accessor.get(IChatService);
-
-			// Simulate the export action logic with file path argument
-			const widget = widgetService.lastFocusedWidget;
-			if (!widget || !widget.viewModel) {
-				assert.fail('Widget should be available for test');
-			}
-
-			const model = chatService.getSession(widget.viewModel.sessionId);
-			if (!model) {
-				assert.fail('Chat model should be available for test');
-			}
-
-			// Export the chat
-			const content = VSBuffer.fromString(JSON.stringify(model.toExport(), undefined, 2));
-			await fileService.writeFile(targetUri, content);
-
-			// Verify the file was written with correct content
-			const lastWrite = (fileService as any)._lastWriteCall;
-			assert.strictEqual(lastWrite.uri.toString(), targetUri.toString());
-			
-			const exportedData = JSON.parse(lastWrite.content.toString());
-			assert.strictEqual(exportedData.version, 1);
-			assert.strictEqual(exportedData.messages.length, 2);
-			assert.strictEqual(exportedData.messages[0].content, 'Hello');
-			assert.strictEqual(exportedData.messages[1].content, 'Hi there!');
-		});
-	});
-
 	test('export chat with file path provided as string', async () => {
 		// Register the actions
 		registerChatExportActions();

@@ -49,17 +49,13 @@ export function registerChatExportActions() {
 			let targetUri: URI | undefined;
 			const firstArg = args[0];
 			
-			if (firstArg) {
-				if (URI.isUri(firstArg)) {
-					targetUri = firstArg;
-				} else if (typeof firstArg === 'string') {
-					// Convert string path to URI
-					try {
-						targetUri = URI.file(firstArg);
-					} catch (error) {
-						// Invalid path provided, fall back to dialog
-						targetUri = undefined;
-					}
+			if (typeof firstArg === 'string') {
+				// Convert string path to URI
+				try {
+					targetUri = URI.file(firstArg);
+				} catch (error) {
+					// Invalid path provided, fall back to dialog
+					targetUri = undefined;
 				}
 			}
 
