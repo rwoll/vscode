@@ -63,6 +63,7 @@ import { IChatRequestViewModel, IChatResponseViewModel, isRequestVM } from '../.
 import { IChatWidgetHistoryService } from '../../common/chatWidgetHistoryService.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { CopilotUsageExtensionFeatureId } from '../../common/languageModelStats.js';
+import { ILanguageModelChatMetadata } from '../../common/languageModels.js';
 import { ILanguageModelToolsService } from '../../common/languageModelToolsService.js';
 import { ChatViewId, IChatWidget, IChatWidgetService, showChatView, showCopilotView } from '../chat.js';
 import { IChatEditorOptions } from '../chatEditor.js';
@@ -110,6 +111,10 @@ export interface IChatViewOpenOptions {
 	 * The mode ID or name to open the chat in.
 	 */
 	mode?: ChatModeKind | string;
+	/**
+	 * The model to use for the chat.
+	 */
+	model?: Pick<ILanguageModelChatMetadata, 'vendor' | 'id' | 'family'>;
 }
 
 export interface IChatViewOpenRequestEntry {
@@ -163,6 +168,10 @@ abstract class OpenChatGlobalAction extends Action2 {
 		const switchToMode = (opts?.mode ? chatModeService.findModeByName(opts?.mode) : undefined) ?? this.mode;
 		if (switchToMode) {
 			await this.handleSwitchToMode(switchToMode, chatWidget, instaService, commandService);
+		}
+
+		if (opts?.model) {
+			chatWidget.input.switchModel(opts.model);
 		}
 
 		if (opts?.previousRequests?.length && chatWidget.viewModel) {

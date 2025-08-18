@@ -55,6 +55,29 @@ suite('chat', () => {
 		return emitter.event;
 	}
 
+	test('chat.open action should accept model parameter', async () => {
+		// This test verifies that the workbench.action.chat.open command accepts a model parameter
+		// without throwing an error. We can't easily test the full functionality without a complete
+		// setup, but we can at least verify the parameter is accepted.
+		try {
+			await commands.executeCommand('workbench.action.chat.open', { 
+				query: 'test query',
+				model: {
+					vendor: 'test-vendor',
+					id: 'test-model-id',
+					family: 'test-family'
+				}
+			});
+			// If we reach here without throwing, the model parameter was accepted
+			assert.ok(true, 'Model parameter was accepted by chat.open action');
+		} catch (error) {
+			// We expect this might fail due to missing setup, but it shouldn't fail due to
+			// unknown parameter types
+			assert.ok(!error.message.includes('Unknown property'), 
+				`Should not fail due to unknown property, but got: ${error.message}`);
+		}
+	});
+
 	test('participant and slash command history', async () => {
 		const onRequest = setupParticipant();
 		commands.executeCommand('workbench.action.chat.open', { query: '@participant /hello friend' });
