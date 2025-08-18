@@ -154,6 +154,11 @@ export interface IChatSendRequestOptions {
 	 * Slash command to use
 	 */
 	slashCommand?: string;
+	/**
+	 * Existing session ID to append to instead of creating a new session.
+	 * If provided, the request will be added to the existing conversation.
+	 */
+	sessionId?: string;
 }
 
 export interface IChatSendRequestResult {
@@ -181,6 +186,14 @@ export interface IChatSendRequestResult {
 	 * The request ID that was created
 	 */
 	requestId?: string;
+	/**
+	 * When rate limited, the number of seconds to wait before retrying
+	 */
+	retryAfterSeconds?: number;
+	/**
+	 * When rate limited, the absolute date/time when retries can be attempted
+	 */
+	retryAfterDate?: Date;
 }
 
 export const CHAT_CONFIG_MENU_ID = new MenuId('workbench.chat.menu.config');
@@ -379,19 +392,37 @@ class SendRequestAction extends Action2 {
 		const fileService = accessor.get(IFileService);
 
 		try {
-			// Create a new chat session for this request
-			const location = ChatAgentLocation.Panel;
-			const model = chatService.startSession(location, CancellationToken.None);
-			const sessionId = model.sessionId;
+			let sessionId: string;
+			let model: IChatModel;
 
-			// Handle previous requests if provided
-			if (opts.previousRequests?.length) {
+			// Use existing session if provided, otherwise create a new one
+			if (opts.sessionId) {
+				const existingModel = chatService.getSession(opts.sessionId);
+				if (existingModel) {
+					model = existingModel;
+					sessionId = opts.sessionId;
+				} else {
+					// Session not found, create a new one
+					const location = ChatAgentLocation.Panel;
+					model = chatService.startSession(location, CancellationToken.None);
+					sessionId = model.sessionId;
+				}
+			} else {
+				// Create a new chat session for this request
+				const location = ChatAgentLocation.Panel;
+				model = chatService.startSession(location, CancellationToken.None);
+				sessionId = model.sessionId;
+			}
+
+			// Handle previous requests if provided (only for new sessions)
+			if (!opts.sessionId && opts.previousRequests?.length) {
 				for (const { request, response } of opts.previousRequests) {
 					await chatService.addCompleteRequest(sessionId, request, undefined, 0, { message: response });
 				}
 			}
 
 			// Set up the request options
+			const location = ChatAgentLocation.Panel;
 			const sendOptions: IChatServiceSendRequestOptions = {
 				location,
 				agentId: opts.agentId,
@@ -482,7 +513,7 @@ class SendRequestAction extends Action2 {
 			// Check for various error conditions
 			if (result?.errorDetails) {
 				const errorDetails = result.errorDetails;
-				return {
+				const resultData: IChatSendRequestResult = {
 					success: false,
 					errorMessage: errorDetails.message,
 					isRateLimited: errorDetails.isQuotaExceeded,
@@ -490,6 +521,34 @@ class SendRequestAction extends Action2 {
 					sessionId,
 					requestId: responseModel.requestId
 				};
+
+				// Extract retry timing information for rate limits
+				if (errorDetails.isQuotaExceeded) {
+					// Look for retry-after information in the error message
+					// Common patterns: "retry after X seconds", "try again in X seconds", etc.
+					const retryMatch = errorDetails.message.match(/(?:retry.*?after|try.*?again.*?in|wait).*?(\d+).*?(?:second|minute|hour)/i);
+					if (retryMatch) {
+						const value = parseInt(retryMatch[1]);
+						const unit = errorDetails.message.toLowerCase();
+						let seconds = value;
+						
+						if (unit.includes('minute')) {
+							seconds = value * 60;
+						} else if (unit.includes('hour')) {
+							seconds = value * 3600;
+						}
+						
+						resultData.retryAfterSeconds = seconds;
+						resultData.retryAfterDate = new Date(Date.now() + (seconds * 1000));
+					} else {
+						// Default retry timing for rate limits when no specific timing is provided
+						// Use a reasonable default of 60 seconds
+						resultData.retryAfterSeconds = 60;
+						resultData.retryAfterDate = new Date(Date.now() + 60000);
+					}
+				}
+
+				return resultData;
 			}
 
 			// Success case
