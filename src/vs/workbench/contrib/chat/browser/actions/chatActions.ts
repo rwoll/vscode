@@ -77,6 +77,7 @@ export const CHAT_CATEGORY = localize2('chat.category', 'Chat');
 export const ACTION_ID_NEW_CHAT = `workbench.action.chat.newChat`;
 export const ACTION_ID_NEW_EDIT_SESSION = `workbench.action.chat.newEditSession`;
 export const CHAT_OPEN_ACTION_ID = 'workbench.action.chat.open';
+export const CHAT_SEND_REQUEST_ACTION_ID = 'workbench.action.chat.sendRequest';
 export const CHAT_SETUP_ACTION_ID = 'workbench.action.chat.triggerSetup';
 const TOGGLE_CHAT_ACTION_ID = 'workbench.action.chat.toggle';
 const CHAT_CLEAR_HISTORY_ACTION_ID = 'workbench.action.chat.clearHistory';
@@ -115,6 +116,29 @@ export interface IChatViewOpenOptions {
 export interface IChatViewOpenRequestEntry {
 	request: string;
 	response: string;
+}
+
+export interface IChatSendRequestResult {
+	/**
+	 * The session ID where the request was sent
+	 */
+	sessionId: string;
+	/**
+	 * The request ID for the sent request
+	 */
+	requestId: string;
+	/**
+	 * The completion status of the request
+	 */
+	status: 'success' | 'error' | 'cancelled';
+	/**
+	 * Error message if status is 'error'
+	 */
+	errorMessage?: string;
+	/**
+	 * Whether the response has a pending prompt or elicitation request
+	 */
+	hasPendingPrompt?: boolean;
 }
 
 export const CHAT_CONFIG_MENU_ID = new MenuId('workbench.chat.menu.config');
@@ -266,6 +290,131 @@ class PrimaryOpenChatGlobalAction extends OpenChatGlobalAction {
 	}
 }
 
+class ChatSendRequestAction extends Action2 {
+	constructor() {
+		super({
+			id: CHAT_SEND_REQUEST_ACTION_ID,
+			title: localize2('sendChatRequest', "Send Chat Request"),
+			category: CHAT_CATEGORY,
+			f1: false,
+			precondition: ContextKeyExpr.and(
+				ChatContextKeys.Setup.hidden.negate(),
+				ChatContextKeys.Setup.disabled.negate()
+			),
+			metadata: {
+				description: localize('sendChatRequest.description', "Send a chat request and wait for the agent to complete"),
+				args: [{
+					name: 'query',
+					description: localize('sendChatRequest.query.description', "The chat query to send"),
+					constraint: 'string'
+				}],
+				returns: localize('sendChatRequest.returns', "Object with completion status and details")
+			}
+		});
+	}
+
+	override async run(accessor: ServicesAccessor, query: string): Promise<IChatSendRequestResult> {
+		if (!query || typeof query !== 'string') {
+			throw new Error('Query parameter is required and must be a string');
+		}
+
+		const chatService = accessor.get(IChatService);
+		const widgetService = accessor.get(IChatWidgetService);
+		const viewsService = accessor.get(IViewsService);
+		const chatAgentService = accessor.get(IChatAgentService);
+
+		// Get or create a chat widget
+		let chatWidget = widgetService.lastFocusedWidget;
+		if (!chatWidget) {
+			chatWidget = await showChatView(viewsService);
+		}
+
+		if (!chatWidget) {
+			throw new Error('Unable to open or access chat view');
+		}
+
+		// Ensure we have a session
+		await chatWidget.waitForReady();
+		await waitForDefaultAgent(chatAgentService, chatWidget.input.currentModeKind);
+
+		const sessionId = chatWidget.viewModel?.sessionId;
+		if (!sessionId) {
+			throw new Error('No active chat session');
+		}
+
+		try {
+			// Send the request
+			const sendResult = await chatService.sendRequest(sessionId, query, {
+				location: ChatAgentLocation.Panel
+			});
+
+			if (!sendResult) {
+				throw new Error('Failed to send chat request');
+			}
+
+			// Wait for the response to be created
+			const response = await sendResult.responseCreatedPromise;
+			const requestId = response.requestId;
+
+			// Wait for the response to complete
+			await sendResult.responseCompletePromise;
+
+			// Analyze the completion state
+			const request = chatService.getSession(sessionId)?.getRequests().find(r => r.id === requestId);
+			const responseModel = request?.response;
+
+			if (!responseModel) {
+				return {
+					sessionId,
+					requestId,
+					status: 'error',
+					errorMessage: 'Response model not found'
+				};
+			}
+
+			// Check for errors
+			if (responseModel.result?.errorDetails) {
+				return {
+					sessionId,
+					requestId,
+					status: 'error',
+					errorMessage: responseModel.result.errorDetails.message
+				};
+			}
+
+			// Check if cancelled
+			if (responseModel.isCanceled) {
+				return {
+					sessionId,
+					requestId,
+					status: 'cancelled'
+				};
+			}
+
+			// Check for pending prompts/elicitations in response
+			const hasPendingPrompt = responseModel.response.value.some((part: any) => 
+				(part.kind === 'confirmation' && !part.isUsed) ||
+				(part.kind === 'elicitation' && part.state === 'pending')
+			);
+
+			return {
+				sessionId,
+				requestId,
+				status: 'success',
+				hasPendingPrompt
+			};
+
+		} catch (error) {
+			return {
+				sessionId,
+				requestId: '',
+				status: 'error',
+				errorMessage: error instanceof Error ? error.message : String(error)
+			};
+		}
+	}
+}
+
 export function getOpenChatActionIdForMode(mode: IChatMode): string {
 	return `workbench.action.chat.open${mode.name}`;
 }
@@ -282,6 +431,7 @@ abstract class ModeOpenChatGlobalAction extends OpenChatGlobalAction {
 
 export function registerChatActions() {
 	registerAction2(PrimaryOpenChatGlobalAction);
+	registerAction2(ChatSendRequestAction);
 	registerAction2(class extends ModeOpenChatGlobalAction {
 		constructor() { super(ChatMode.Ask); }
 	});
