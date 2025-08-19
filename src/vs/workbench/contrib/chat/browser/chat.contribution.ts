@@ -905,31 +905,11 @@ CommandsRegistry.registerCommand('workspace.chat.sendRequest', async (accessor, 
 		return { state: 'error', reason: 'rejected' } as const;
 	}
 
-	// Helper to detect a pending user prompt (tool confirmation or elicitation)
-	const detectPendingUserPrompt = () => {
-		const parts = response.entireResponse.value;
-		for (const part of parts as any[]) {
-			if (part?.kind === 'elicitation' && part.state === 'pending') {
-				return { kind: 'elicitation' as const };
-			}
-			if (part?.kind === 'confirmation' && part.isUsed === false) {
-				return { kind: 'confirmation' as const };
-			}
-			if ((part?.kind === 'toolInvocation' || part?.kind === 'toolInvocationSerialized') && part.isConfirmed === undefined) {
-				// When a tool requires confirmation, isConfirmed stays undefined until the user responds
-				return { kind: 'confirmation' as const };
-			}
-		}
-		return undefined;
-	};
-
-	// Wait until the response completes OR we detect a pending user prompt
-	const pendingPrompt = detectPendingUserPrompt();
-	if (!response.isComplete && !pendingPrompt) {
+	console.log('RESPONSE', response);
+	if (!response.isComplete || response.isPendingConfirmation) {
 		await new Promise<void>(resolve => {
 			const d = response.onDidChange(() => {
-				// Resolve when either completed or a pending prompt is detected
-				if (response.isComplete || detectPendingUserPrompt()) {
+				if (response.isComplete || response.isPendingConfirmation) {
 					d.dispose();
 					resolve();
 				}
@@ -937,22 +917,5 @@ CommandsRegistry.registerCommand('workspace.chat.sendRequest', async (accessor, 
 		});
 	}
 
-	// If we reached a pending user prompt, return a 'prompt' state so callers can react
-	const promptState = detectPendingUserPrompt();
-	if (promptState) {
-		return { state: 'prompt', reason: promptState.kind } as const;
-	}
-
-	// Classify terminal state
-	if (response.isCanceled) {
-		return { state: 'error', reason: 'canceled' } as const;
-	}
-	const result = response.result;
-	if (result?.errorDetails) {
-		return { state: 'error', error: result.errorDetails } as const;
-	}
-	if (result?.nextQuestion) {
-		return { state: 'prompt', nextQuestion: result.nextQuestion } as const;
-	}
-	return { state: 'done' } as const;
+	return response;
 });
