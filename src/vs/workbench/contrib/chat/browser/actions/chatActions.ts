@@ -392,7 +392,7 @@ class ChatSendRequestAction extends Action2 {
 			}
 
 			// Check for pending prompts/elicitations in response
-			const hasPendingPrompt = responseModel.response.value.some((part: any) => 
+			const hasPendingPrompt = responseModel.response.value.some((part: any) =>
 				(part.kind === 'confirmation' && !part.isUsed) ||
 				(part.kind === 'elicitation' && part.state === 'pending')
 			);
