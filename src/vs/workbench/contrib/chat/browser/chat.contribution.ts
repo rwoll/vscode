@@ -15,7 +15,7 @@ import { registerEditorFeature } from '../../../../editor/common/editorFeatures.
 import * as nls from '../../../../nls.js';
 import { AccessibleViewRegistry } from '../../../../platform/accessibility/browser/accessibleViewRegistry.js';
 import { registerAction2 } from '../../../../platform/actions/common/actions.js';
-import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
 import { Extensions as ConfigurationExtensions, ConfigurationScope, IConfigurationNode, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
@@ -26,6 +26,7 @@ import { EditorPaneDescriptor, IEditorPaneRegistry } from '../../../browser/edit
 import { Extensions, IConfigurationMigrationRegistry } from '../../../common/configuration.js';
 import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/contributions.js';
 import { EditorExtensions, IEditorFactoryRegistry } from '../../../common/editor.js';
+import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
 import { IEditorResolverService, RegisteredEditorPriority } from '../../../services/editor/common/editorResolverService.js';
 import { AddConfigurationType, AssistedTypes } from '../../mcp/browser/mcpCommandsAddConfiguration.js';
@@ -76,7 +77,7 @@ import { registerQuickChatActions } from './actions/chatQuickInputActions.js';
 import { registerChatTitleActions } from './actions/chatTitleActions.js';
 import { registerChatToolActions } from './actions/chatToolActions.js';
 import { ChatTransferContribution } from './actions/chatTransfer.js';
-import { IChatAccessibilityService, IChatCodeBlockContextProviderService, IChatWidgetService, IQuickChatService } from './chat.js';
+import { IChatAccessibilityService, IChatCodeBlockContextProviderService, IChatWidget, IChatWidgetService, IQuickChatService, showChatView } from './chat.js';
 import { ChatAccessibilityService } from './chatAccessibilityService.js';
 import './chatAttachmentModel.js';
 import { ChatAttachmentResolveService, IChatAttachmentResolveService } from './chatAttachmentResolveService.js';
@@ -859,3 +860,99 @@ import { RenameChatSessionAction } from './actions/chatSessionActions.js';
 registerAction2(RenameChatSessionAction);
 
 ChatWidget.CONTRIBS.push(ChatDynamicVariableModel);
+
+// Command: workspace.chat.sendRequest
+// Sends a chat request and waits until the full response is completed, then returns
+// a terminal state summary: { state: 'done' | 'prompt' | 'error', ...details }
+CommandsRegistry.registerCommand('workspace.chat.sendRequest', async (accessor, args?: string | { query: string; location?: ChatAgentLocation }) => {
+	const query = typeof args === 'string' ? args : args?.query;
+	const location = (typeof args === 'object' && args?.location) ? args.location : ChatAgentLocation.Panel;
+
+	if (!query || !query.trim()) {
+		return { state: 'error', reason: 'emptyQuery' } as const;
+	}
+
+	const chatWidgetService = accessor.get(IChatWidgetService);
+	const viewsService = accessor.get(IViewsService);
+
+	let widget: IChatWidget | undefined = chatWidgetService.lastFocusedWidget;
+	if (!widget) {
+		// Try to reuse an existing widget for the target location first
+		const widgets = chatWidgetService.getWidgetsByLocations(location);
+		widget = widgets?.[0];
+	}
+	if (!widget) {
+		// Create/show the chat view if none available
+		widget = await showChatView(viewsService);
+	}
+	if (!widget) {
+		return { state: 'error', reason: 'noWidget' } as const;
+	}
+
+	// Ensure the widget is fully ready (session initialized) and set Agent mode
+	await widget.waitForReady();
+	if (widget.supportsChangingModes) {
+		try {
+			widget.input.setChatMode(ChatModeKind.Agent);
+		} catch {
+			// ignore if mode cannot be set; validateAgentMode() will handle fallbacks later
+		}
+	}
+
+	// Submit the request (this creates the response model but does not wait for completion)
+	const response = await widget.acceptInput(query);
+	if (!response) {
+		return { state: 'error', reason: 'rejected' } as const;
+	}
+
+	// Helper to detect a pending user prompt (tool confirmation or elicitation)
+	const detectPendingUserPrompt = () => {
+		const parts = response.entireResponse.value;
+		for (const part of parts as any[]) {
+			if (part?.kind === 'elicitation' && part.state === 'pending') {
+				return { kind: 'elicitation' as const };
+			}
+			if (part?.kind === 'confirmation' && part.isUsed === false) {
+				return { kind: 'confirmation' as const };
+			}
+			if ((part?.kind === 'toolInvocation' || part?.kind === 'toolInvocationSerialized') && part.isConfirmed === undefined) {
+				// When a tool requires confirmation, isConfirmed stays undefined until the user responds
+				return { kind: 'confirmation' as const };
+			}
+		}
+		return undefined;
+	};
+
+	// Wait until the response completes OR we detect a pending user prompt
+	const pendingPrompt = detectPendingUserPrompt();
+	if (!response.isComplete && !pendingPrompt) {
+		await new Promise<void>(resolve => {
+			const d = response.onDidChange(() => {
+				// Resolve when either completed or a pending prompt is detected
+				if (response.isComplete || detectPendingUserPrompt()) {
+					d.dispose();
+					resolve();
+				}
+			});
+		});
+	}
+
+	// If we reached a pending user prompt, return a 'prompt' state so callers can react
+	const promptState = detectPendingUserPrompt();
+	if (promptState) {
+		return { state: 'prompt', reason: promptState.kind } as const;
+	}
+
+	// Classify terminal state
+	if (response.isCanceled) {
+		return { state: 'error', reason: 'canceled' } as const;
+	}
+	const result = response.result;
+	if (result?.errorDetails) {
+		return { state: 'error', error: result.errorDetails } as const;
+	}
+	if (result?.nextQuestion) {
+		return { state: 'prompt', nextQuestion: result.nextQuestion } as const;
+	}
+	return { state: 'done' } as const;
+});
