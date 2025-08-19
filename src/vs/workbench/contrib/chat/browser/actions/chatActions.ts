@@ -54,6 +54,7 @@ import { IChatAgentService } from '../../common/chatAgents.js';
 import { ChatContextKeys } from '../../common/chatContextKeys.js';
 import { IChatEditingSession, ModifiedFileEntryState } from '../../common/chatEditingService.js';
 import { ChatEntitlement, IChatEntitlementService } from '../../common/chatEntitlementService.js';
+import { IChatResponseModel } from '../../common/chatModel.js';
 import { ChatMode, IChatMode, IChatModeService } from '../../common/chatModes.js';
 import { extractAgentAndCommand } from '../../common/chatParserTypes.js';
 import { IChatDetail, IChatService } from '../../common/chatService.js';
@@ -98,6 +99,10 @@ export interface IChatViewOpenOptions {
 	 * Any previous chat requests and responses that should be shown in the chat view.
 	 */
 	previousRequests?: IChatViewOpenRequestEntry[];
+	/**
+	 * Whether to wait for the agent to finish processing before the command returns.
+	 */
+	waitForCompletion?: boolean;
 	/**
 	 * Whether a screenshot of the focused window should be taken and attached
 	 */
@@ -189,7 +194,12 @@ abstract class OpenChatGlobalAction extends Action2 {
 			} else {
 				await chatWidget.waitForReady();
 				await waitForDefaultAgent(chatAgentService, chatWidget.input.currentModeKind);
-				chatWidget.acceptInput(opts.query);
+				const response = await chatWidget.acceptInput(opts.query);
+				
+				// Wait for the agent to complete if requested
+				if (opts.waitForCompletion && response) {
+					await waitForChatResponseCompletion(response);
+				}
 			}
 		}
 		if (opts?.toolIds && opts.toolIds.length > 0) {
@@ -243,6 +253,16 @@ async function waitForDefaultAgent(chatAgentService: IChatAgentService, mode: Ch
 		})),
 		timeout(60_000).then(() => { throw new Error('Timed out waiting for default agent'); })
 	]);
+}
+
+async function waitForChatResponseCompletion(response: IChatResponseModel): Promise<void> {
+	// If already complete, return immediately
+	if (response.isComplete) {
+		return;
+	}
+
+	// Wait for the response to complete
+	await Event.toPromise(Event.filter(response.onDidChange, () => response.isComplete));
 }
 
 class PrimaryOpenChatGlobalAction extends OpenChatGlobalAction {
