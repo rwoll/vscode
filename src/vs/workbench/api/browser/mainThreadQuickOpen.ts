@@ -9,6 +9,9 @@ import { extHostNamedCustomer, IExtHostContext } from '../../services/extensions
 import { URI } from '../../../base/common/uri.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { DisposableStore } from '../../../base/common/lifecycle.js';
+import { IQuickInputDebugInterceptor } from '../../../platform/quickinput/common/quickInputDebug.js';
+import { QuickInputDebugInterceptor } from '../../../platform/quickinput/browser/quickInputDebugInterceptor.js';
+import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 
 interface QuickInputSession {
 	input: IQuickInput;
@@ -28,6 +31,7 @@ export class MainThreadQuickOpen implements MainThreadQuickOpenShape {
 
 	private readonly _proxy: ExtHostQuickOpenShape;
 	private readonly _quickInputService: IQuickInputService;
+	private readonly _debugInterceptor: IQuickInputDebugInterceptor;
 	private readonly _items: Record<number, {
 		resolve(items: TransferQuickPickItemOrSeparator[]): void;
 		reject(error: Error): void;
@@ -35,19 +39,31 @@ export class MainThreadQuickOpen implements MainThreadQuickOpenShape {
 
 	constructor(
 		extHostContext: IExtHostContext,
-		@IQuickInputService quickInputService: IQuickInputService
+		@IQuickInputService quickInputService: IQuickInputService,
+		@IConfigurationService configurationService: IConfigurationService
 	) {
 		this._proxy = extHostContext.getProxy(ExtHostContext.ExtHostQuickOpen);
 		this._quickInputService = quickInputService;
+		this._debugInterceptor = new QuickInputDebugInterceptor(configurationService);
 	}
 
 	public dispose(): void {
+		this._debugInterceptor.dispose();
 		for (const [_id, session] of this.sessions) {
 			session.store.dispose();
 		}
 	}
 
+	/**
+	 * Get the debug interceptor for external access (e.g., IPC channels)
+	 */
+	public getDebugInterceptor(): IQuickInputDebugInterceptor {
+		return this._debugInterceptor;
+	}
+
 	$show(instance: number, options: IPickOptions<TransferQuickPickItem>, token: CancellationToken): Promise<number | number[] | undefined> {
+		const startTime = this._debugInterceptor.logOperation('$show', [instance, options]);
+		
 		const contents = new Promise<TransferQuickPickItemOrSeparator[]>((resolve, reject) => {
 			this._items[instance] = { resolve, reject };
 		});
@@ -62,19 +78,27 @@ export class MainThreadQuickOpen implements MainThreadQuickOpenShape {
 		};
 
 		if (options.canPickMany) {
-			return this._quickInputService.pick(contents, options as { canPickMany: true }, token).then(items => {
-				if (items) {
-					return items.map(item => item.handle);
-				}
-				return undefined;
-			});
+			return this._quickInputService.pick(contents, options as { canPickMany: true }, token)
+				.then(items => {
+					const result = items ? items.map(item => item.handle) : undefined;
+					this._debugInterceptor.logResult(startTime, result);
+					return result;
+				})
+				.catch(error => {
+					this._debugInterceptor.logError(startTime, error);
+					throw error;
+				});
 		} else {
-			return this._quickInputService.pick(contents, options, token).then(item => {
-				if (item) {
-					return item.handle;
-				}
-				return undefined;
-			});
+			return this._quickInputService.pick(contents, options, token)
+				.then(item => {
+					const result = item ? item.handle : undefined;
+					this._debugInterceptor.logResult(startTime, result);
+					return result;
+				})
+				.catch(error => {
+					this._debugInterceptor.logError(startTime, error);
+					throw error;
+				});
 		}
 	}
 
@@ -97,6 +121,8 @@ export class MainThreadQuickOpen implements MainThreadQuickOpenShape {
 	// ---- input
 
 	$input(options: IInputBoxOptions | undefined, validateInput: boolean, token: CancellationToken): Promise<string | undefined> {
+		const startTime = this._debugInterceptor.logOperation('$input', [options, validateInput]);
+		
 		const inputOptions: IInputOptions = Object.create(null);
 
 		if (options) {
@@ -115,7 +141,15 @@ export class MainThreadQuickOpen implements MainThreadQuickOpenShape {
 			};
 		}
 
-		return this._quickInputService.input(inputOptions, token);
+		return this._quickInputService.input(inputOptions, token)
+			.then(result => {
+				this._debugInterceptor.logResult(startTime, result);
+				return result;
+			})
+			.catch(error => {
+				this._debugInterceptor.logError(startTime, error);
+				throw error;
+			});
 	}
 
 	// ---- QuickInput
