@@ -52,6 +52,9 @@ export class ChatBranchService extends Disposable implements IChatBranchService 
 		for (const repository of this.scmService.repositories) {
 			this.onRepositoryAdded(repository);
 		}
+		
+		// If we found a repository, try to initialize immediately
+		this.initializeFromExistingRepositories();
 	}
 
 	getCurrentBranch(): string | undefined {
@@ -65,30 +68,43 @@ export class ChatBranchService extends Disposable implements IChatBranchService 
 	getBranchKey(branch: string | undefined, repositoryRoot: string | undefined): string {
 		// Create a unique key that combines repository and branch
 		// This ensures branch names are unique across different repositories
-		const repoKey = repositoryRoot ? repositoryRoot.replace(/[^a-zA-Z0-9]/g, '_') : 'no-repo';
-		const branchKey = branch || 'no-branch';
+		let repoKey = 'no-repo';
+		if (repositoryRoot) {
+			// Sanitize repository path to create a safe key
+			// Remove any non-alphanumeric characters and limit length
+			repoKey = repositoryRoot
+				.replace(/[^a-zA-Z0-9]/g, '_')
+				.substring(0, 50) // Limit length to prevent overly long keys
+				.toLowerCase();
+		}
+		
+		const branchKey = (branch || 'no-branch').substring(0, 50); // Limit branch name length too
 		return `${repoKey}:${branchKey}`;
 	}
 
 	private onRepositoryAdded(repository: any): void {
-		this.logService.trace('[ChatBranchService] Repository added:', repository.provider?.rootUri?.fsPath);
+		this.logService.trace('[ChatBranchService] Repository added:', repository?.provider?.label || 'unknown');
 		
-		// Check if this is a git repository
-		if (repository.provider?.id === 'git') {
-			this._repositoryRoot = repository.provider.rootUri?.fsPath;
+		// Check if this is a git repository 
+		// The repository object is an ISCMRepository with a provider
+		if (repository?.provider?.id === 'git') {
+			const rootUri = repository.provider.rootUri;
+			this._repositoryRoot = rootUri?.fsPath;
 			this.updateCurrentBranch(repository);
 			
-			// Listen for state changes in the git repository
-			this._register(repository.provider.onDidChangeState?.(() => {
+			// Listen for resource changes which indicate repository state changes
+			// This is safer than trying to access specific git events
+			this._register(repository.provider.onDidChangeResources(() => {
 				this.debouncedUpdateBranch(repository);
 			}));
 		}
 	}
 
 	private onRepositoryRemoved(repository: any): void {
-		this.logService.trace('[ChatBranchService] Repository removed:', repository.provider?.rootUri?.fsPath);
+		const removedRoot = repository?.provider?.rootUri?.fsPath;
+		this.logService.trace('[ChatBranchService] Repository removed:', removedRoot);
 		
-		if (repository.provider?.rootUri?.fsPath === this._repositoryRoot) {
+		if (removedRoot === this._repositoryRoot) {
 			const previousBranch = this._currentBranch;
 			const previousRoot = this._repositoryRoot;
 			
@@ -103,6 +119,18 @@ export class ChatBranchService extends Disposable implements IChatBranchService 
 		}
 	}
 
+	private initializeFromExistingRepositories(): void {
+		// Try to find a git repository if we haven't found one yet
+		if (!this._repositoryRoot && !this._currentBranch) {
+			for (const repository of this.scmService.repositories) {
+				if (repository.provider?.id === 'git') {
+					this.updateCurrentBranch(repository);
+					break; // Use the first git repository we find
+				}
+			}
+		}
+	}
+
 	@debounce(100)
 	private debouncedUpdateBranch(repository: any): void {
 		this.updateCurrentBranch(repository);
@@ -110,10 +138,31 @@ export class ChatBranchService extends Disposable implements IChatBranchService 
 
 	private updateCurrentBranch(repository: any): void {
 		try {
-			// Access the HEAD information from the git repository
-			const head = repository.provider?.HEAD;
-			const newBranch = head?.name;
-			const repositoryRoot = repository.provider?.rootUri?.fsPath;
+			// For git repositories, we need to access the branch through the provider's state
+			// Different git extensions might expose this differently
+			let newBranch: string | undefined;
+			let repositoryRoot: string | undefined;
+			
+			if (repository?.provider) {
+				repositoryRoot = repository.provider.rootUri?.fsPath;
+				
+				// Try different ways to access the current branch
+				// This depends on how the git extension exposes the branch information
+				// We'll use a safe approach that works with different git extension implementations
+				if (repository.provider.HEAD) {
+					newBranch = repository.provider.HEAD.name;
+				} else if (repository.provider.state?.HEAD) {
+					newBranch = repository.provider.state.HEAD.name;
+				}
+				// Additional fallback - check for branch in label or status
+				else if (repository.provider.label && repository.provider.label.includes('(')) {
+					// Some implementations include branch in label like "Git (main)"
+					const match = repository.provider.label.match(/\(([^)]+)\)$/);
+					if (match) {
+						newBranch = match[1];
+					}
+				}
+			}
 
 			if (newBranch !== this._currentBranch || repositoryRoot !== this._repositoryRoot) {
 				const previousBranch = this._currentBranch;
