@@ -66,6 +66,7 @@ import { WorkbenchList } from '../../../../platform/list/browser/listService.js'
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { IThemeService } from '../../../../platform/theme/common/themeService.js';
 import { ISharedWebContentExtractorService } from '../../../../platform/webContentExtractor/common/webContentExtractor.js';
 import { ResourceLabels } from '../../../browser/labels.js';
@@ -84,6 +85,7 @@ import { IChatFollowup } from '../common/chatService.js';
 import { ChatRequestVariableSet, IChatRequestVariableEntry, isElementVariableEntry, isImageVariableEntry, isNotebookOutputVariableEntry, isPasteVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry, isSCMHistoryItemChangeRangeVariableEntry, isSCMHistoryItemChangeVariableEntry, isSCMHistoryItemVariableEntry } from '../common/chatVariableEntries.js';
 import { IChatResponseViewModel } from '../common/chatViewModel.js';
 import { ChatInputHistoryMaxEntries, IChatHistoryEntry, IChatInputState, IChatWidgetHistoryService } from '../common/chatWidgetHistoryService.js';
+import { IChatBranchService } from '../common/chatBranchService.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind, validateChatMode } from '../common/constants.js';
 import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../common/languageModels.js';
 import { ILanguageModelToolsService } from '../common/languageModelToolsService.js';
@@ -376,6 +378,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		getContribsInputState: () => any,
 		private readonly inline: boolean,
 		@IChatWidgetHistoryService private readonly historyService: IChatWidgetHistoryService,
+		@IChatBranchService private readonly branchService: IChatBranchService,
 		@IModelService private readonly modelService: IModelService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IContextKeyService private readonly contextKeyService: IContextKeyService,
@@ -397,6 +400,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IChatModeService private readonly chatModeService: IChatModeService,
 		@IPromptsService private readonly promptsService: IPromptsService,
 		@ILanguageModelToolsService private readonly toolService: ILanguageModelToolsService,
+		@ITelemetryService private readonly telemetryService: ITelemetryService,
 	) {
 		super();
 		this._onDidLoadInputState = this._register(new Emitter<any>());
@@ -472,6 +476,37 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		this.history = this.loadHistory();
 		this._register(this.historyService.onDidClearHistory(() => this.history = new HistoryNavigator2<IChatHistoryEntry>([{ text: '', state: this.getInputState() }], ChatInputHistoryMaxEntries, historyKeyFn)));
+
+		// Listen for branch changes and reload history when the branch changes
+		this._register(this.branchService.onDidChangeBranch((event) => {
+			this.logService.trace('[ChatInputPart] Branch changed, reloading history', event);
+			
+			// Send telemetry about branch-specific chat usage
+			type ChatBranchChangeEvent = {
+				previousBranch: string | undefined;
+				currentBranch: string | undefined;
+				hasRepository: boolean;
+				location: string;
+			};
+			
+			type ChatBranchChangeClassification = {
+				previousBranch: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The previous git branch name (or undefined if no branch).' };
+				currentBranch: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The current git branch name (or undefined if no branch).' };
+				hasRepository: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; isMeasurement: true; comment: 'Whether a git repository is available.' };
+				location: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The chat location where the branch change occurred.' };
+				owner: 'rwoll';
+				comment: 'Tracks when users switch git branches and get branch-specific chat history.';
+			};
+			
+			this.telemetryService.publicLog2<ChatBranchChangeEvent, ChatBranchChangeClassification>('chatBranchChange', {
+				previousBranch: event.previousBranch,
+				currentBranch: event.currentBranch,
+				hasRepository: !!event.repositoryRoot,
+				location: this.location
+			});
+			
+			this.history = this.loadHistory();
+		}));
 
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
 			const newOptions: IEditorOptions = {};

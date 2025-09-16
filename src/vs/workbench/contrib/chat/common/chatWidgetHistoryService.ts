@@ -12,6 +12,7 @@ import { ModifiedFileEntryState } from './chatEditingService.js';
 import { CHAT_PROVIDER_ID } from './chatParticipantContribTypes.js';
 import { IChatRequestVariableEntry } from './chatVariableEntries.js';
 import { ChatAgentLocation, ChatModeKind } from './constants.js';
+import { IChatBranchService } from './chatBranchService.js';
 
 export interface IChatHistoryEntry {
 	text: string;
@@ -58,7 +59,8 @@ export class ChatWidgetHistoryService implements IChatWidgetHistoryService {
 	readonly onDidClearHistory: Event<void> = this._onDidClearHistory.event;
 
 	constructor(
-		@IStorageService storageService: IStorageService
+		@IStorageService storageService: IStorageService,
+		@IChatBranchService private readonly branchService: IChatBranchService
 	) {
 		this.memento = new Memento('interactive-session', storageService);
 		const loadedState = this.memento.getMemento(StorageScope.WORKSPACE, StorageTarget.MACHINE) as IChatHistory;
@@ -76,8 +78,27 @@ export class ChatWidgetHistoryService implements IChatWidgetHistoryService {
 	}
 
 	private getKey(location: ChatAgentLocation): string {
-		// Preserve history for panel by continuing to use the same old provider id. Use the location as a key for other chat locations.
-		return location === ChatAgentLocation.Chat ? CHAT_PROVIDER_ID : location;
+		// Get the current branch and repository information
+		const currentBranch = this.branchService.getCurrentBranch();
+		const repositoryRoot = this.branchService.getRepositoryRoot();
+		
+		// Create the base key based on location
+		let baseKey: string;
+		if (location === ChatAgentLocation.Chat) {
+			// Preserve history for panel by continuing to use the same old provider id
+			baseKey = CHAT_PROVIDER_ID;
+		} else {
+			baseKey = location;
+		}
+		
+		// If we have git repository information, make the key branch-specific
+		if (currentBranch && repositoryRoot) {
+			const branchKey = this.branchService.getBranchKey(currentBranch, repositoryRoot);
+			return `${baseKey}:${branchKey}`;
+		}
+		
+		// Fallback to the original key if no git information is available
+		return baseKey;
 	}
 
 	saveHistory(location: ChatAgentLocation, history: IChatHistoryEntry[]): void {

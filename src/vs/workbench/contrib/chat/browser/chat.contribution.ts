@@ -30,6 +30,7 @@ import { IEditorResolverService, RegisteredEditorPriority } from '../../../servi
 import { AddConfigurationType, AssistedTypes } from '../../mcp/browser/mcpCommandsAddConfiguration.js';
 import { allDiscoverySources, discoverySourceSettingsLabel, mcpDiscoverySection, mcpServerSamplingSection } from '../../mcp/common/mcpConfiguration.js';
 import { ChatAgentNameService, ChatAgentService, IChatAgentNameService, IChatAgentService } from '../common/chatAgents.js';
+import { IChatBranchService, ChatBranchService } from '../common/chatBranchService.js';
 import { CodeMapperService, ICodeMapperService } from '../common/chatCodeMapperService.js';
 import '../common/chatColors.js';
 import { IChatEditingService } from '../common/chatEditingService.js';
@@ -938,6 +939,7 @@ registerSingleton(IChatWidgetService, ChatWidgetService, InstantiationType.Delay
 registerSingleton(IQuickChatService, QuickChatService, InstantiationType.Delayed);
 registerSingleton(IChatAccessibilityService, ChatAccessibilityService, InstantiationType.Delayed);
 registerSingleton(IChatWidgetHistoryService, ChatWidgetHistoryService, InstantiationType.Delayed);
+registerSingleton(IChatBranchService, ChatBranchService, InstantiationType.Delayed);
 registerSingleton(ILanguageModelsService, LanguageModelsService, InstantiationType.Delayed);
 registerSingleton(ILanguageModelStatsService, LanguageModelStatsService, InstantiationType.Delayed);
 registerSingleton(IChatSlashCommandService, ChatSlashCommandService, InstantiationType.Delayed);
