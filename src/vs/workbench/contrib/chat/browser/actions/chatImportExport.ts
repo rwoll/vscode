@@ -34,7 +34,7 @@ export function registerChatExportActions() {
 				f1: true,
 			});
 		}
-		async run(accessor: ServicesAccessor, outputPath?: URI) {
+		async run(accessor: ServicesAccessor, ...args: unknown[]) {
 			const widgetService = accessor.get(IChatWidgetService);
 			const fileDialogService = accessor.get(IFileDialogService);
 			const fileService = accessor.get(IFileService);
@@ -43,6 +43,17 @@ export function registerChatExportActions() {
 			const widget = widgetService.lastFocusedWidget;
 			if (!widget || !widget.viewModel) {
 				return;
+			}
+
+			// Support both URI and string filepath arguments
+			let outputPath: URI | undefined;
+			if (args.length > 0) {
+				const arg = args[0];
+				if (URI.isUri(arg)) {
+					outputPath = arg;
+				} else if (typeof arg === 'string') {
+					outputPath = URI.file(arg);
+				}
 			}
 
 			if (!outputPath) {
@@ -83,17 +94,31 @@ export function registerChatExportActions() {
 			const fileService = accessor.get(IFileService);
 			const widgetService = accessor.get(IChatWidgetService);
 
-			const defaultUri = joinPath(await fileDialogService.defaultFilePath(), defaultFileName);
-			const result = await fileDialogService.showOpenDialog({
-				defaultUri,
-				canSelectFiles: true,
-				filters
-			});
-			if (!result) {
-				return;
+			// Support both URI and string filepath arguments
+			let inputPath: URI | undefined;
+			if (args.length > 0) {
+				const arg = args[0];
+				if (URI.isUri(arg)) {
+					inputPath = arg;
+				} else if (typeof arg === 'string') {
+					inputPath = URI.file(arg);
+				}
 			}
 
-			const content = await fileService.readFile(result[0]);
+			if (!inputPath) {
+				const defaultUri = joinPath(await fileDialogService.defaultFilePath(), defaultFileName);
+				const result = await fileDialogService.showOpenDialog({
+					defaultUri,
+					canSelectFiles: true,
+					filters
+				});
+				if (!result) {
+					return;
+				}
+				inputPath = result[0];
+			}
+
+			const content = await fileService.readFile(inputPath);
 			try {
 				const data = revive(JSON.parse(content.value.toString()));
 				if (!isExportableSessionData(data)) {
