@@ -95,9 +95,12 @@ suite('Chat Import/Export Actions', () => {
 		};
 
 		const mockWidgetService = new class extends mock<IChatWidgetService>() {
-			override async openSession(uri: URI, _location: any, options: any) {
-				assert.ok(options.target.data);
-				assert.deepStrictEqual(options.target.data, importData);
+			override async openSession(uri: URI, _location?: any, options?: any): Promise<any> {
+				if (options) {
+					assert.ok(options.target.data);
+					assert.deepStrictEqual(options.target.data, importData);
+				}
+				return undefined;
 			}
 		};
 
