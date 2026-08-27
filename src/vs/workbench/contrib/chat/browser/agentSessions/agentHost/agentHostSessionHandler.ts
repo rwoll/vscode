@@ -1597,8 +1597,15 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				initialProgress,
 				historySubagentObservations,
 				() => {
-					this._activeSessions.delete(sessionResource);
 					this._disposeActiveClientEntry(sessionResource);
+					// Only tear down when this session still owns the entry. The state
+					// below is keyed by session resource and shared with any replacement,
+					// so a late-arriving session that never registered (or was displaced)
+					// must not release the live session's subscriptions.
+					if (this._activeSessions.get(sessionResource) !== session) {
+						return;
+					}
+					this._activeSessions.delete(sessionResource);
 					this._pendingMessageSubscriptions.deleteAndDispose(sessionResource);
 					this._draftSyncSubscriptions.deleteAndDispose(sessionResource);
 					this._serverTurnWatchers.deleteAndDispose(sessionResource);

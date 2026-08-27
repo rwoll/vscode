@@ -3640,6 +3640,22 @@ suite('AgentHostClientTools', () => {
 				assert.deepStrictEqual(removals, [], 'the shared active client must survive while the claim holds it');
 			});
 
+			test('a displaced chat releases its active-client hold', async () => {
+				const { handler, connection } = createHandlerWithMocks(disposables, [testRunTaskTool]);
+				const claimDisposable = await claim(handler);
+				const chatResource = URI.parse('agent-host-copilotcli:/session-1');
+				const firstChat = await handler.provideChatSessionContent(chatResource, CancellationToken.None);
+				const replacementChat = await handler.provideChatSessionContent(chatResource, CancellationToken.None);
+
+				firstChat.dispose();
+				replacementChat.dispose();
+				claimDisposable.dispose();
+
+				const removals = connection.dispatchedActions.filter(entry =>
+					isSessionAction(entry.action) && entry.action.type === ActionType.SessionActiveClientRemoved);
+				assert.strictEqual(removals.length, 1, 'each chat must release its holder even when it no longer owns the shared session state');
+			});
+
 			test('stops serving client tools once the claim is released', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
 				const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
 
