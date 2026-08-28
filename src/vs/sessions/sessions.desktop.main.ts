@@ -239,6 +239,8 @@ import './contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHo
 // Change Preferred Remote Agent Location (Chat: ... command)
 import './contrib/providers/remoteAgentHost/electron-browser/remoteAgentHostLocationPreferenceCommand.js';
 import './contrib/providers/remoteAgentHost/electron-browser/forgetSSHHostKeyCommand.js';
+// Private, unlisted attachment to an existing evaluation session (no UI surface)
+import './contrib/providers/remoteAgentHost/electron-browser/attachEvaluationSession.contribution.js';
 // Copilot cloud sandbox connections (copilot-developer-cli) over a Web PubSub AHP relay
 import './contrib/providers/remoteAgentHost/browser/cloudSandboxAgentHost.contribution.js';
 // Chat

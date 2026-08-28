@@ -36,6 +36,7 @@ import { BrowserViewAttachmentDisplayKind, BrowserViewAttachmentMetadataKey } fr
 import { readToolCallMeta } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
 import { readCompletionAttachmentMeta } from '../../../../../../platform/agentHost/common/meta/agentCompletionAttachmentMeta.js';
 import { IRemoteAgentHostService } from '../../../../../../platform/agentHost/common/remoteAgentHostService.js';
+import { IAgentHostEvaluationSessionAttachmentService } from '../../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
 import { SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
 import { isWorktreeUnderRepository } from '../../../../../../platform/agentHost/common/worktreePaths.js';
 import { CLIENT_SEMANTIC_SEARCH_TOOL_ID, SEMANTIC_SEARCH_TOOL_NAME } from '../../../../../../platform/agentHost/common/semanticSearchConstants.js';
@@ -1142,6 +1143,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		@IChatResponseFileChangesService private readonly _chatResponseFileChangesService: IChatResponseFileChangesService,
 		@IPathService private readonly _pathService: IPathService,
 		@IRemoteAgentHostService private readonly _remoteAgentHostService: IRemoteAgentHostService,
+		@IAgentHostEvaluationSessionAttachmentService private readonly _evaluationSessionAttachmentService: IAgentHostEvaluationSessionAttachmentService,
 		@IAgentHostCustomizationService private readonly _customizationService: IAgentHostCustomizationService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IWorkbenchAssignmentService assignmentService: IWorkbenchAssignmentService,
@@ -2510,6 +2512,11 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				return;
 			}
 
+			if (this._evaluationSessionAttachmentService.isAttached(backendSession)) {
+				this._watchEvaluationSessionClientToolRequest(requests, request$, itemStore, initial, startedClientToolCalls, clientToolExecutions, releaseClientToolExecution);
+				return;
+			}
+
 			const key = this._toolCallKey(chatURI, initial.turnId, initial.toolCall.toolCallId);
 			const requestLifecycle = itemStore.add(new MutableDisposable<IDisposable>());
 			itemStore.add(this._retainToolCall(key));
@@ -2616,6 +2623,143 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 						}, UNOBSERVED_CLIENT_TOOL_GRACE_MS);
 					}
 				}));
+			}
+		}));
+	}
+
+	private _watchEvaluationSessionClientToolRequest(
+		requests: IObservable<readonly ObservedSessionInputRequest[]>,
+		request$: IObservable<ObservedSessionInputRequest>,
+		itemStore: DisposableStore,
+		initial: ClientToolExecutionRequest,
+		startedClientToolCalls: Set<string>,
+		clientToolExecutions: Map<string, { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }>,
+		releaseClientToolExecution: (key: string, execution: { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }) => void,
+	): void {
+		const key = this._toolCallKey(initial.chat.toString(), initial.turnId, initial.toolCall.toolCallId);
+		const requestLifecycle = itemStore.add(new MutableDisposable<IDisposable>());
+		itemStore.add(this._retainToolCall(key));
+
+		let execution = clientToolExecutions.get(key);
+		if (!execution) {
+			execution = { source: new CancellationTokenSource(), retain: this._retainToolCall(key), activeAttempts: 0 };
+			clientToolExecutions.set(key, execution);
+		}
+		const targetsConfirmation = initial.toolCall.status === ToolCallStatus.PendingConfirmation;
+		requestLifecycle.value = toDisposable(() => {
+			const state = this._clientToolInvocations.get(key)?.state.get();
+			const targetsState = state?.type === IChatToolInvocation.StateKind.Streaming
+				|| state?.type === (targetsConfirmation
+					? IChatToolInvocation.StateKind.WaitingForConfirmation
+					: IChatToolInvocation.StateKind.Executing)
+				|| (execution.activeAttempts > 0
+					&& (state?.type === IChatToolInvocation.StateKind.Cancelled
+						|| state?.type === IChatToolInvocation.StateKind.Completed));
+			const hasApprovedSuccessor = targetsConfirmation && invocationStarted
+				&& requests.get().some(candidate => this._isOwnedClientToolRequest(candidate)
+					&& candidate.toolCall.status === ToolCallStatus.Running
+					&& this._toolCallKey(candidate.chat.toString(), candidate.turnId, candidate.toolCall.toolCallId) === key
+					&& getClientToolPreApproval(candidate.toolCall) !== undefined);
+			const approvedBeforeRemoval = targetsConfirmation
+				&& (state?.type === IChatToolInvocation.StateKind.Executing || hasApprovedSuccessor);
+			if (approvedBeforeRemoval) {
+				startedClientToolCalls.add(key);
+			} else {
+				if (targetsState) {
+					execution.source.cancel();
+				}
+				releaseClientToolExecution(key, execution);
+			}
+		});
+
+		let generation = 0;
+		let observedRequest: ClientToolExecutionRequest | undefined;
+		let startedRequest: ClientToolExecutionRequest | undefined;
+		let invocationStarted = false;
+		const unobservedTimer = itemStore.add(new MutableDisposable<IDisposable>());
+		itemStore.add(autorun(reader => {
+			const request = request$.read(reader);
+			if (!this._isOwnedClientToolRequest(request)
+				|| this._toolCallKey(request.chat.toString(), request.turnId, request.toolCall.toolCallId) !== key) {
+				generation++;
+				observedRequest = undefined;
+				startedRequest = undefined;
+				invocationStarted = false;
+				unobservedTimer.clear();
+				return;
+			}
+			const claimant = this._renderedRequests.read(reader).get(key);
+
+			const externalConfirmation = request.toolCall.status === ToolCallStatus.Running
+				? getClientToolPreApproval(request.toolCall)
+				: undefined;
+			const invocation = this._clientToolInvocations.get(key);
+			if (externalConfirmation && invocation && !IChatToolInvocation.executionConfirmedOrDenied(invocation)) {
+				IChatToolInvocation.confirmWith(invocation, externalConfirmation);
+			}
+
+			if (startedClientToolCalls.has(key)) {
+				startedRequest = request;
+				unobservedTimer.clear();
+				return;
+			}
+			if (!equals(observedRequest, request)) {
+				observedRequest = request;
+				if (invocationStarted) {
+					return;
+				}
+				generation++;
+				startedRequest = undefined;
+				unobservedTimer.clear();
+			}
+			if (startedRequest) {
+				return;
+			}
+			if (request.toolCall.toolName === RUNTIME_TOOL_SEARCH_TOOL_NAME
+				&& readToolCallMeta(request.toolCall).toolSearchCandidates === undefined) {
+				return;
+			}
+			const execute = (contextSessionResource: URI | undefined) => {
+				startedRequest = request;
+				unobservedTimer.clear();
+				const requestGeneration = generation;
+				execution.activeAttempts++;
+				void this._executeClientTool(
+					request,
+					contextSessionResource,
+					execution.source.token,
+					() => requestGeneration === generation && (invocationStarted || equals(request$.read(undefined), request)),
+					() => {
+						if (requestGeneration === generation) {
+							invocationStarted = true;
+							if (request.toolCall.status !== ToolCallStatus.PendingConfirmation) {
+								startedClientToolCalls.add(key);
+							}
+						}
+					},
+				).finally(() => {
+					execution.activeAttempts--;
+					const invocation = this._clientToolInvocations.get(key);
+					if (execution.activeAttempts === 0 && invocation && IChatToolInvocation.isComplete(invocation)) {
+						releaseClientToolExecution(key, execution);
+					} else if (execution.activeAttempts === 0 && clientToolExecutions.get(key) !== execution) {
+						execution.source.dispose();
+					}
+				});
+			};
+			if (claimant) {
+				execute(claimant);
+			} else if (externalConfirmation || !this._clientToolRequiresConfirmation(request.toolCall)) {
+				execute(undefined);
+			} else if (!unobservedTimer.value) {
+				const requestGeneration = generation;
+				unobservedTimer.value = disposableTimeout(() => {
+					if (requestGeneration === generation && !startedRequest) {
+						startedRequest = request;
+						startedClientToolCalls.add(key);
+						this._denyClientTool(request);
+					}
+				}, UNOBSERVED_CLIENT_TOOL_GRACE_MS);
 			}
 		}));
 	}
