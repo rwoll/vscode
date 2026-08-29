@@ -5,6 +5,7 @@
 
 import { disposableTimeout, raceTimeout } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { onUnexpectedError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
 import { ResourceMap } from '../../../../base/common/map.js';
@@ -87,6 +88,8 @@ export interface ICloseChatOptions {
 export interface IOpenSessionOptions {
 	readonly preserveFocus?: boolean;
 	readonly source?: SessionOpenSource;
+	/** Called exactly once: `true` on success, `false` when superseded or failed. */
+	readonly onDidCompleteOpen?: (completed: boolean) => void;
 }
 
 /**
@@ -191,9 +194,10 @@ export interface ISessionsService {
 	/**
 	 * Whether the given session may be opened, honoring workspace trust. Prompts
 	 * for trust on any untrusted folder the session runs in and resolves to
-	 * `false` if the user declines.
+	 * `false` if the user declines. By default, the already-active session skips
+	 * this gate; callers that grant additional capabilities may force the check.
 	 */
-	canOpenSession(session: ISession): Promise<boolean>;
+	canOpenSession(session: ISession, options?: { readonly forceTrustCheck?: boolean }): Promise<boolean>;
 
 	/**
 	 * Open a specific chat within a session and show it in the grid.
@@ -848,31 +852,51 @@ export class SessionsService extends Disposable implements ISessionsService {
 
 	async openSession(sessionResource: URI, options?: IOpenSessionOptions): Promise<void> {
 		this.logService.trace(`[SessionsView] openSession requested uri=${sessionResource.toString()}`);
-		// Claim the open before resolving: resolution can take seconds for a legacy
-		// Copilot CLI resource, and a newer open must win regardless of which
-		// resolution finishes first.
-		this._cancelRestore();
-		const token = this._startOpenSession();
-		await this.sessionOpenTelemetryService.withOpenRequest(options?.source ?? 'unknown', token, async telemetryAttempt => {
-			// Redirect a superseded resource (legacy session adopted into another
-			// provider) before lookup, so an open by URI migrates rather than reaching
-			// the old provider. Providers decline unfamiliar resources and the caller
-			// keeps the original resource.
-			const resolved = await this.sessionsManagementService.resolveSessionResource(sessionResource, 'open');
-			if (token.isCancellationRequested) {
+		const callback = options?.onDidCompleteOpen;
+		let callbackInvoked = false;
+		const completeOpen = (completed: boolean) => {
+			if (!callback || callbackInvoked) {
 				return;
 			}
-			const sessionData = this._getSession(resolved);
-			this.sessionOpenTelemetryService.sessionResolved(
-				telemetryAttempt,
-				sessionData.resource,
-				sessionData.providerId,
-				this.activeSession.get()?.sessionId === sessionData.sessionId,
-				sessionData.loading.get(),
-			);
-			this._showSession(sessionData, options);
-			await this._waitForOpenSessionToLoad(sessionData, token, telemetryAttempt);
-		});
+			callbackInvoked = true;
+			try {
+				callback(completed);
+			} catch (error) {
+				onUnexpectedError(error);
+			}
+		};
+
+		let completed = false;
+		try {
+			// Claim the open before resolving: resolution can take seconds for a legacy
+			// Copilot CLI resource, and a newer open must win regardless of which
+			// resolution finishes first.
+			this._cancelRestore();
+			const token = this._startOpenSession();
+			await this.sessionOpenTelemetryService.withOpenRequest(options?.source ?? 'unknown', token, async telemetryAttempt => {
+				// Redirect a superseded resource (legacy session adopted into another
+				// provider) before lookup, so an open by URI migrates rather than reaching
+				// the old provider. Providers decline unfamiliar resources and the caller
+				// keeps the original resource.
+				const resolved = await this.sessionsManagementService.resolveSessionResource(sessionResource, 'open');
+				if (token.isCancellationRequested) {
+					return;
+				}
+				const sessionData = this._getSession(resolved);
+				this.sessionOpenTelemetryService.sessionResolved(
+					telemetryAttempt,
+					sessionData.resource,
+					sessionData.providerId,
+					this.activeSession.get()?.sessionId === sessionData.sessionId,
+					sessionData.loading.get(),
+				);
+				this._showSession(sessionData, options);
+				await this._waitForOpenSessionToLoad(sessionData, token, telemetryAttempt);
+			});
+			completed = !token.isCancellationRequested;
+		} finally {
+			completeOpen(completed);
+		}
 	}
 
 	showSession(sessionResource: URI, options?: { preserveFocus?: boolean }): void {
@@ -881,11 +905,16 @@ export class SessionsService extends Disposable implements ISessionsService {
 		this._showSession(this._getSession(sessionResource), options);
 	}
 
-	async canOpenSession(session: ISession): Promise<boolean> {
-		// Re-focusing the already-active session is not a new open, so never gate it.
-		if (this.activeSession.get()?.sessionId === session.sessionId) {
+	async canOpenSession(session: ISession, options?: { readonly forceTrustCheck?: boolean }): Promise<boolean> {
+		// Re-focusing the already-active session is not a new open, so the normal
+		// path does not gate it.
+		if (!options?.forceTrustCheck && this.activeSession.get()?.sessionId === session.sessionId) {
 			return true;
 		}
+		return this._canTrustSession(session);
+	}
+
+	private async _canTrustSession(session: ISession): Promise<boolean> {
 		const workspace = session.workspace.get();
 		// A session that doesn't require workspace trust (virtual/cloud/quick-chat),
 		// or whose workspace metadata has not hydrated yet, opens without a check; a

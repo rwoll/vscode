@@ -3,52 +3,59 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { toDisposable, type IDisposable } from '../../../base/common/lifecycle.js';
+import { Emitter, type Event } from '../../../base/common/event.js';
+import { Disposable, toDisposable, type IDisposable } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
-import { AgentSession, type AgentProvider } from './agent.js';
-import { parseRemoteAgentHostHarness } from './agentHostSessionType.js';
 
 export const IAgentHostEvaluationSessionAttachmentService = createDecorator<IAgentHostEvaluationSessionAttachmentService>('agentHostEvaluationSessionAttachmentService');
+
+export interface IAgentHostEvaluationSessionIdentity {
+	readonly connectionAuthority: string;
+	readonly backendSession: URI;
+}
 
 /** Internal, process-local marker for an attached evaluation session. */
 export interface IAgentHostEvaluationSessionAttachmentService {
 	readonly _serviceBrand: undefined;
-	register(session: URI): IDisposable;
-	isAttached(session: URI): boolean;
+	readonly onDidChangeAttachment: Event<IAgentHostEvaluationSessionIdentity>;
+	register(session: IAgentHostEvaluationSessionIdentity): IDisposable;
+	isAttached(session: IAgentHostEvaluationSessionIdentity): boolean;
 }
 
-export class AgentHostEvaluationSessionAttachmentService implements IAgentHostEvaluationSessionAttachmentService {
+export class AgentHostEvaluationSessionAttachmentService extends Disposable implements IAgentHostEvaluationSessionAttachmentService {
 	declare readonly _serviceBrand: undefined;
 
 	private readonly _sessions = new Map<string, number>();
+	private readonly _onDidChangeAttachment = this._register(new Emitter<IAgentHostEvaluationSessionIdentity>());
+	readonly onDidChangeAttachment = this._onDidChangeAttachment.event;
 
-	register(session: URI): IDisposable {
-		const backendSession = toBackendSession(session);
-		if (!backendSession) {
-			throw new Error('The evaluation session attachment requires a remote Agent Host session resource.');
+	register(session: IAgentHostEvaluationSessionIdentity): IDisposable {
+		if (!session.connectionAuthority || !session.backendSession.scheme || !session.backendSession.path || session.backendSession.path === '/') {
+			throw new Error('The evaluation session attachment requires a connection authority and backend session.');
 		}
-		const key = backendSession.toString();
-		this._sessions.set(key, (this._sessions.get(key) ?? 0) + 1);
+		const key = sessionKey(session);
+		const count = this._sessions.get(key) ?? 0;
+		this._sessions.set(key, count + 1);
+		if (count === 0) {
+			this._onDidChangeAttachment.fire(session);
+		}
 		return toDisposable(() => {
 			const remaining = (this._sessions.get(key) ?? 1) - 1;
 			if (remaining > 0) {
 				this._sessions.set(key, remaining);
 			} else {
 				this._sessions.delete(key);
+				this._onDidChangeAttachment.fire(session);
 			}
 		});
 	}
 
-	isAttached(session: URI): boolean {
-		return this._sessions.has(session.toString());
+	isAttached(session: IAgentHostEvaluationSessionIdentity): boolean {
+		return this._sessions.has(sessionKey(session));
 	}
 }
 
-function toBackendSession(sessionResource: URI): URI | undefined {
-	const provider = parseRemoteAgentHostHarness(sessionResource.scheme) as AgentProvider | undefined;
-	if (!provider || !sessionResource.path || sessionResource.path === '/') {
-		return undefined;
-	}
-	return AgentSession.uri(provider, AgentSession.id(sessionResource));
+function sessionKey(session: IAgentHostEvaluationSessionIdentity): string {
+	return `${session.connectionAuthority}\0${session.backendSession.toString()}`;
 }

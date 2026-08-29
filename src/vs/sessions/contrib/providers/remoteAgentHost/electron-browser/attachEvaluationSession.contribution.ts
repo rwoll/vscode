@@ -6,16 +6,20 @@
 import { disposableTimeout } from '../../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../../base/common/errors.js';
+import { Event } from '../../../../../base/common/event.js';
 import { Disposable, DisposableStore, MutableDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
+import { observableFromEvent, waitForState } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
-import { IAgentHostEvaluationSessionAttachmentService } from '../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
-import { parseRemoteAgentHostHarness } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
+import { type AgentProvider } from '../../../../../platform/agentHost/common/agent.js';
+import { IAgentHostEvaluationSessionAttachmentService, type IAgentHostEvaluationSessionIdentity } from '../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
+import { parseRemoteAgentHostHarness, parseRemoteAgentHostSessionTypeAuthority } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { registerWorkbenchContribution2, WorkbenchPhase, type IWorkbenchContribution } from '../../../../../workbench/common/contributions.js';
 import { INativeWorkbenchEnvironmentService } from '../../../../../workbench/services/environment/electron-browser/environmentService.js';
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
-import { ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
+import type { ISession, ISessionWorkspace } from '../../../../services/sessions/common/session.js';
+import { ISessionsManagementService, WorkspaceNotTrustedError } from '../../../../services/sessions/common/sessionsManagement.js';
 
 /** Private, unlisted launch argument naming one existing evaluation session to attach to. */
 export const ATTACH_TO_EVALUATION_SESSION_ARG = 'attachToEvaluationSession';
@@ -43,7 +47,13 @@ export function parseAttachEvaluationSessionDirective(value: string | undefined)
 	if (resource.toString() !== value || resource.scheme !== resource.scheme.toLowerCase()) {
 		return undefined;
 	}
-	return parseRemoteAgentHostHarness(resource.scheme) && resource.path && resource.path !== '/' ? resource : undefined;
+	const provider = parseRemoteAgentHostHarness(resource.scheme) as AgentProvider | undefined;
+	return provider
+		&& parseRemoteAgentHostSessionTypeAuthority(resource.scheme, provider)
+		&& resource.path
+		&& resource.path !== '/'
+		? resource
+		: undefined;
 }
 
 /**
@@ -96,18 +106,29 @@ export class AttachEvaluationSessionContribution extends Disposable implements I
 		return this._instantiationService.invokeFunction(async accessor => {
 			const managementService = accessor.get(ISessionsManagementService);
 			const sessionsService = accessor.get(ISessionsService);
-			await whenSessionListed(managementService, resource, token);
+			const listedSession = await whenSessionListed(managementService, resource, token);
+			const session = await whenRemoteSessionWorkspaceHydrated(managementService, resource, listedSession, token);
+			if (!await sessionsService.canOpenSession(session, { forceTrustCheck: true })) {
+				throw new WorkspaceNotTrustedError();
+			}
 
 			const lifetime = new DisposableStore();
-			lifetime.add(this._evaluationSessionAttachmentService.register(resource));
-			lifetime.add(managementService.onDidChangeSessions(() => {
-				if (!managementService.getSession(resource)) {
+			lifetime.add(this._evaluationSessionAttachmentService.register(toEvaluationSessionIdentity(resource, session)));
+			lifetime.add(managementService.onDidDeleteSession(deleted => {
+				if (deleted.sessionId === session.sessionId && deleted.resource.toString() === resource.toString()) {
 					this._evaluationSessionAttachment.clear();
 				}
 			}));
 			this._evaluationSessionAttachment.value = lifetime;
 			try {
-				await sessionsService.openSession(resource, { preserveFocus: false });
+				let completed = false;
+				await sessionsService.openSession(resource, {
+					preserveFocus: false,
+					onDidCompleteOpen: value => completed = value,
+				});
+				if (!completed) {
+					throw new Error('The requested evaluation session was superseded before it opened.');
+				}
 			} catch (error) {
 				this._evaluationSessionAttachment.clear();
 				throw error;
@@ -116,21 +137,39 @@ export class AttachEvaluationSessionContribution extends Disposable implements I
 	}
 }
 
+function toEvaluationSessionIdentity(resource: URI, session: ISession): IAgentHostEvaluationSessionIdentity {
+	const provider = parseRemoteAgentHostHarness(resource.scheme) as AgentProvider;
+	const connectionAuthority = parseRemoteAgentHostSessionTypeAuthority(resource.scheme, provider);
+	const backendSession = (session as ISession & { readonly backendUri?: unknown }).backendUri;
+	if (!connectionAuthority
+		|| !URI.isUri(backendSession)
+		|| !backendSession.scheme
+		|| backendSession.path !== resource.path) {
+		throw new Error('The evaluation session attachment requires a remote Agent Host session resource.');
+	}
+	return {
+		connectionAuthority,
+		backendSession,
+	};
+}
+
 /**
  * Resolves once {@link resource} is one of the sessions the providers list,
  * driven purely by `onDidChangeSessions`: it schedules nothing and polls
  * nothing. The caller supplies its deadline through {@link token}.
  */
-function whenSessionListed(managementService: ISessionsManagementService, resource: URI, token: CancellationToken): Promise<void> {
-	if (managementService.getSession(resource)) {
-		return Promise.resolve();
+function whenSessionListed(managementService: ISessionsManagementService, resource: URI, token: CancellationToken): Promise<ISession> {
+	const listed = managementService.getSession(resource);
+	if (listed) {
+		return Promise.resolve(listed);
 	}
 	return new Promise((resolve, reject) => {
 		const store = new DisposableStore();
 		const settle = (settled: () => void) => { store.dispose(); settled(); };
 		store.add(managementService.onDidChangeSessions(() => {
-			if (managementService.getSession(resource)) {
-				settle(resolve);
+			const session = managementService.getSession(resource);
+			if (session) {
+				settle(() => resolve(session));
 			}
 		}));
 		store.add(token.onCancellationRequested(() => settle(() => reject(new CancellationError()))));
@@ -138,6 +177,37 @@ function whenSessionListed(managementService: ISessionsManagementService, resour
 			settle(() => reject(new CancellationError()));
 		}
 	});
+}
+
+interface IWorkspaceHydrationState {
+	readonly session: ISession | undefined;
+	readonly workspace: ISessionWorkspace | undefined;
+}
+
+async function whenRemoteSessionWorkspaceHydrated(
+	managementService: ISessionsManagementService,
+	resource: URI,
+	listedSession: ISession,
+	token: CancellationToken,
+): Promise<ISession> {
+	const sessionObservable = observableFromEvent(
+		Event.any(managementService.onDidChangeSessions, managementService.onDidDeleteSession),
+		() => managementService.getSession(resource),
+	);
+	const workspaceState = sessionObservable.map((session, reader): IWorkspaceHydrationState => {
+		if (!session || session.sessionId !== listedSession.sessionId) {
+			return { session: undefined, workspace: undefined };
+		}
+		return { session, workspace: session.workspace.read(reader) };
+	});
+	const hydrated = await waitForState(
+		workspaceState,
+		(state): state is IWorkspaceHydrationState & { readonly session: ISession; readonly workspace: ISessionWorkspace } =>
+			state.session !== undefined && state.workspace !== undefined,
+		state => state.session === undefined ? new Error('The requested evaluation session disappeared before its workspace metadata was available.') : false,
+		token,
+	);
+	return hydrated.session;
 }
 
 registerWorkbenchContribution2(AttachEvaluationSessionContribution.ID, AttachEvaluationSessionContribution, WorkbenchPhase.AfterRestored);

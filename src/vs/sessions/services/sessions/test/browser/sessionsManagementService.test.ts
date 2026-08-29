@@ -6,6 +6,7 @@
 import assert from 'assert';
 import { DeferredPromise, timeout } from '../../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../../base/common/cancellation.js';
+import { errorHandler } from '../../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { toDisposable } from '../../../../../base/common/lifecycle.js';
 import { autorun, constObservable, observableValue } from '../../../../../base/common/observable.js';
@@ -354,6 +355,100 @@ suite('SessionsManagementService', () => {
 		await openPromise;
 
 		assert.deepStrictEqual({ resolved }, { resolved: true });
+	});
+
+	test('openSession completes its callback exactly once on success', async () => {
+		const session = stubSession({ sessionId: 'success', providerId: 'test' });
+		const { view } = createSessionsManagementService(session, disposables);
+		const completions: boolean[] = [];
+
+		await view.openSession(session.resource, { onDidCompleteOpen: completed => completions.push(completed) });
+
+		assert.deepStrictEqual(completions, [true]);
+	});
+
+	test('openSession completes the superseded operation callback exactly once with false', async () => {
+		const loading = observableValue('loading', true);
+		const first = stubSession({ sessionId: 'first', providerId: 'test', loading });
+		const second = stubSession({ sessionId: 'second', providerId: 'test' });
+		const provider = new class extends TestSessionsProvider {
+			constructor() { super(first); }
+			override getSessions(): ISession[] { return [first, second]; }
+		};
+		const { view } = createSessionsManagementService(first, disposables, provider);
+		const completions: boolean[] = [];
+
+		const superseded = view.openSession(first.resource, { onDidCompleteOpen: completed => completions.push(completed) });
+		await Promise.resolve();
+		await view.openSession(second.resource);
+		await superseded;
+
+		assert.deepStrictEqual(completions, [false]);
+	});
+
+	test('openSession completes the callback once and preserves a resource resolution error', async () => {
+		const session = stubSession({ sessionId: 'resource-error', providerId: 'test' });
+		const { service, view } = createSessionsManagementService(session, disposables);
+		const resourceError = new Error('resource resolution failed');
+		const completions: boolean[] = [];
+		service.resolveSessionResource = async () => { throw resourceError; };
+
+		await assert.rejects(
+			() => view.openSession(session.resource, { onDidCompleteOpen: completed => completions.push(completed) }),
+			error => error === resourceError,
+		);
+		assert.deepStrictEqual(completions, [false]);
+	});
+
+	test('openSession preserves a session error when its completion callback throws', async () => {
+		const session = stubSession({ sessionId: 'session-error', providerId: 'test' });
+		const { service, view } = createSessionsManagementService(session, disposables);
+		const sessionError = new Error('session lookup failed');
+		const callbackError = new Error('completion callback failed');
+		const previousUnexpectedErrorHandler = errorHandler.getUnexpectedErrorHandler();
+		const reportedErrors: unknown[] = [];
+		let callbackCalls = 0;
+		service.getSession = () => { throw sessionError; };
+		errorHandler.setUnexpectedErrorHandler(error => reportedErrors.push(error));
+
+		try {
+			await assert.rejects(
+				() => view.openSession(session.resource, {
+					onDidCompleteOpen: () => {
+						callbackCalls++;
+						throw callbackError;
+					},
+				}),
+				error => error === sessionError,
+			);
+		} finally {
+			errorHandler.setUnexpectedErrorHandler(previousUnexpectedErrorHandler);
+		}
+
+		assert.strictEqual(callbackCalls, 1);
+		assert.deepStrictEqual(reportedErrors, [callbackError]);
+	});
+
+	test('openSession completes the callback once and preserves a load error', async () => {
+		const loadError = new Error('session load failed');
+		const loading = observableValue('loading', true);
+		const getLoading = loading.get.bind(loading);
+		let loadingReads = 0;
+		loading.get = () => {
+			if (++loadingReads === 2) {
+				throw loadError;
+			}
+			return getLoading();
+		};
+		const session = stubSession({ sessionId: 'load-error', providerId: 'test', loading });
+		const { view } = createSessionsManagementService(session, disposables);
+		const completions: boolean[] = [];
+
+		await assert.rejects(
+			() => view.openSession(session.resource, { onDidCompleteOpen: completed => completions.push(completed) }),
+			error => error === loadError,
+		);
+		assert.deepStrictEqual(completions, [false]);
 	});
 
 	test('marks the active session as read via its provider even when its provider state was unread', async () => {
@@ -825,6 +920,100 @@ suite('SessionsManagementService', () => {
 			granted: [],
 			prompts: [worktree.toString()],
 		});
+	});
+
+	test('canOpenSession skips the trust path for the active session by default', async () => {
+		const folder = URI.file('/active-untrusted');
+		const session = stubSession({
+			sessionId: 'active-untrusted',
+			providerId: 'test',
+			workspace: constObservable({
+				uri: folder,
+				label: 'active',
+				icon: Codicon.vm,
+				folders: [{ root: folder, workingDirectory: folder, name: 'active', description: undefined }],
+				requiresWorkspaceTrust: true,
+				isVirtualWorkspace: false,
+			} satisfies ISessionWorkspace),
+		});
+		const trustManagement = new TestWorkspaceTrustManagementService();
+		trustManagement.trusted = false;
+		const { view } = createSessionsManagementService(session, disposables, new TestSessionsProvider(session), trustManagement);
+		view.showSession(session.resource);
+
+		const canOpen = await view.canOpenSession(session);
+
+		assert.strictEqual(canOpen, true);
+		assert.deepStrictEqual(trustManagement.requestedUris, []);
+	});
+
+	test('canOpenSession forceTrustCheck validates every folder of the active session', async () => {
+		const firstFolder = URI.file('/active-first');
+		const secondFolder = URI.file('/active-second');
+		const session = stubSession({
+			sessionId: 'active-multi-folder',
+			providerId: 'test',
+			workspace: constObservable({
+				uri: firstFolder,
+				label: 'active',
+				icon: Codicon.vm,
+				folders: [
+					{ root: firstFolder, workingDirectory: firstFolder, name: 'first', description: undefined },
+					{ root: secondFolder, workingDirectory: secondFolder, name: 'second', description: undefined },
+				],
+				requiresWorkspaceTrust: true,
+				isVirtualWorkspace: false,
+			} satisfies ISessionWorkspace),
+		});
+		const trustManagement = new TestWorkspaceTrustManagementService();
+		trustManagement.trusted = false;
+		const promptedUris: URI[] = [];
+		const trustRequest = new class extends mock<IWorkspaceTrustRequestService>() {
+			override async requestResourcesTrust(options: ResourceTrustRequestOptions) {
+				promptedUris.push(options.uri);
+				return false;
+			}
+		};
+		const { view } = createSessionsManagementService(session, disposables, new TestSessionsProvider(session), trustManagement, trustRequest);
+		view.showSession(session.resource);
+
+		const canOpen = await view.canOpenSession(session, { forceTrustCheck: true });
+
+		assert.strictEqual(canOpen, false);
+		assert.deepStrictEqual(trustManagement.requestedUris.map(uri => uri.toString()), [firstFolder.toString(), secondFolder.toString()]);
+		assert.deepStrictEqual(promptedUris.map(uri => uri.toString()), [firstFolder.toString()]);
+	});
+
+	test('canOpenSession keeps the non-active trust behavior without forceTrustCheck', async () => {
+		const folder = URI.file('/inactive-untrusted');
+		const session = stubSession({
+			sessionId: 'inactive-untrusted',
+			providerId: 'test',
+			workspace: constObservable({
+				uri: folder,
+				label: 'inactive',
+				icon: Codicon.vm,
+				folders: [{ root: folder, workingDirectory: folder, name: 'inactive', description: undefined }],
+				requiresWorkspaceTrust: true,
+				isVirtualWorkspace: false,
+			} satisfies ISessionWorkspace),
+		});
+		const trustManagement = new TestWorkspaceTrustManagementService();
+		trustManagement.trusted = false;
+		const promptedUris: URI[] = [];
+		const trustRequest = new class extends mock<IWorkspaceTrustRequestService>() {
+			override async requestResourcesTrust(options: ResourceTrustRequestOptions) {
+				promptedUris.push(options.uri);
+				return true;
+			}
+		};
+		const { view } = createSessionsManagementService(session, disposables, new TestSessionsProvider(session), trustManagement, trustRequest);
+
+		const canOpen = await view.canOpenSession(session);
+
+		assert.strictEqual(canOpen, true);
+		assert.deepStrictEqual(trustManagement.requestedUris.map(uri => uri.toString()), [folder.toString()]);
+		assert.deepStrictEqual(promptedUris.map(uri => uri.toString()), [folder.toString()]);
 	});
 
 	test('cancelled openNewSession does not replace a newer draft after workspace trust resolves', async () => {

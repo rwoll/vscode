@@ -36,7 +36,7 @@ import { BrowserViewAttachmentDisplayKind, BrowserViewAttachmentMetadataKey } fr
 import { readToolCallMeta } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
 import { readCompletionAttachmentMeta } from '../../../../../../platform/agentHost/common/meta/agentCompletionAttachmentMeta.js';
 import { IRemoteAgentHostService } from '../../../../../../platform/agentHost/common/remoteAgentHostService.js';
-import { IAgentHostEvaluationSessionAttachmentService } from '../../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
+import { IAgentHostEvaluationSessionAttachmentService, type IAgentHostEvaluationSessionIdentity } from '../../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
 import { SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
 import { isWorktreeUnderRepository } from '../../../../../../platform/agentHost/common/worktreePaths.js';
 import { CLIENT_SEMANTIC_SEARCH_TOOL_ID, SEMANTIC_SEARCH_TOOL_NAME } from '../../../../../../platform/agentHost/common/semanticSearchConstants.js';
@@ -136,6 +136,7 @@ const CHAT_ACTIVITY_PROGRESS_ID = 'agentHost.chatActivity';
 const CUSTOMIZATION_ENABLEMENT_PROTOCOL_VERSION = '0.8.0';
 
 export const UNOBSERVED_CLIENT_TOOL_GRACE_MS = 5000;
+export const EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS = 5000;
 type AgentHostInvocationFailureStage = 'resolveSession' | 'provisionalSession' | 'sessionState' | 'authentication' | 'createSession' | 'subscribeSession' | 'prepareTurn' | 'dispatchTurn' | 'observeTurn';
 
 interface IRestoredSubagentState extends IDisposable {
@@ -148,6 +149,24 @@ type ClientToolExecutionRequest = Omit<SessionToolClientExecutionRequest, 'toolC
 };
 
 type ObservedSessionInputRequest = Exclude<SessionInputRequest, SessionToolClientExecutionRequest> | ClientToolExecutionRequest;
+
+interface IClientToolExecution {
+	readonly source: CancellationTokenSource;
+	readonly retain: IDisposable;
+	activeAttempts: number;
+}
+
+interface IEvaluationClientToolController {
+	readonly execution: IClientToolExecution;
+	readonly generation: ISettableObservable<number>;
+	owner: object | undefined;
+	requestId: string | undefined;
+	invocationStarted: boolean;
+	completed: boolean;
+	awaitingSuccessor: boolean;
+	fromConfirmation: boolean;
+	readonly handoffTimer: MutableDisposable<IDisposable>;
+}
 
 type AgentHostInvocationFailedEvent = {
 	requestId: string;
@@ -1033,6 +1052,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 	private readonly _renderedRequests = observableValue<ReadonlyMap<string, URI>>(this, new Map());
 	/** Tool calls whose protocol outcome has already been dispatched. */
 	private readonly _resolvedToolCalls = new Set<string>();
+	/** Client tool confirmations learned from protocol running state rather than this window's UI. */
+	private readonly _externalClientToolConfirmations = new Set<string>();
 	/**
 	 * A single {@link ChatToolInvocation} per client tool call, keyed by
 	 * {@link _toolCallKey}. Created lazily by whichever of the session-level
@@ -2458,14 +2479,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		}
 
 		const sessionSub = this._ensureSessionSubscription(sessionKey);
-		const state = observableFromSubscription(this, sessionSub);
 		const store = new DisposableStore();
 		this._inputNeededWatchers.set(sessionKey, { store, refs: new Set([sessionResource.toString()]) });
 
 		// Requests that we own should be 'invoked' when pending confirmation immediately because
 		// we handle showing their UI directly. For simplicity in later tool call flows, rewrite them.
-		const requests = derivedOpts({ equalsFn: equals }, reader =>
-			(state.read(reader)?.inputNeeded ?? []).map((request): ObservedSessionInputRequest => {
+		const toObservedRequests = (inputNeeded: readonly SessionInputRequest[] | undefined): readonly ObservedSessionInputRequest[] =>
+			(inputNeeded ?? []).map((request): ObservedSessionInputRequest => {
 				if (request.kind === SessionInputRequestKind.ToolConfirmation
 					&& request.toolCall.status === ToolCallStatus.PendingConfirmation
 					&& request.toolCall.contributor?.kind === ToolCallContributorKind.Client) {
@@ -2477,12 +2497,41 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 					};
 				}
 				return request;
-			})
-		);
+			});
 
 		const startedClientToolCalls = new Set<string>();
-		const clientToolExecutions = new Map<string, { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }>();
-		const releaseClientToolExecution = (key: string, execution: { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }) => {
+		const clientToolExecutions = new Map<string, IClientToolExecution>();
+		const evaluationClientToolControllers = new Map<string, IEvaluationClientToolController>();
+		const evaluationRequestRemovalHandlers = new Map<string, (requests: readonly ObservedSessionInputRequest[]) => void>();
+		store.add(sessionSub.onWillApplyAction(envelope => {
+			if (envelope.action.type !== ActionType.SessionInputNeededRemoved) {
+				return;
+			}
+			const currentState = sessionSub.value;
+			if (!currentState || currentState instanceof Error) {
+				return;
+			}
+			const removedRequestId = envelope.action.id;
+			const currentRequests = toObservedRequests(currentState.inputNeeded)
+				.filter(request => request.id !== removedRequestId);
+			evaluationRequestRemovalHandlers.get(removedRequestId)?.(currentRequests);
+		}));
+		store.add(sessionSub.onDidChange(value => {
+			const currentRequests = toObservedRequests(value.inputNeeded);
+			const currentIds = new Set(currentRequests.map(request => request.id));
+			for (const [requestId, handler] of evaluationRequestRemovalHandlers) {
+				if (!currentIds.has(requestId)) {
+					handler(currentRequests);
+				}
+			}
+		}));
+		const state = observableFromSubscription(this, sessionSub);
+		const requests = derivedOpts({ equalsFn: equals }, reader => toObservedRequests(state.read(reader)?.inputNeeded));
+		const evaluationAttachmentIdentity: IAgentHostEvaluationSessionIdentity = {
+			connectionAuthority: this._config.connectionAuthority,
+			backendSession,
+		};
+		const releaseClientToolExecution = (key: string, execution: IClientToolExecution) => {
 			if (clientToolExecutions.get(key) !== execution) {
 				return;
 			}
@@ -2498,6 +2547,11 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				execution.retain.dispose();
 			}
 			clientToolExecutions.clear();
+			for (const controller of evaluationClientToolControllers.values()) {
+				controller.handoffTimer.dispose();
+			}
+			evaluationClientToolControllers.clear();
+			evaluationRequestRemovalHandlers.clear();
 		}));
 
 		// This watcher is the single point of truth for how client tools
@@ -2512,8 +2566,19 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				return;
 			}
 
-			if (this._evaluationSessionAttachmentService.isAttached(backendSession)) {
-				this._watchEvaluationSessionClientToolRequest(requests, request$, itemStore, initial, startedClientToolCalls, clientToolExecutions, releaseClientToolExecution);
+			if (this._evaluationSessionAttachmentService.isAttached(evaluationAttachmentIdentity)) {
+				this._watchEvaluationSessionClientToolRequest(
+					requests,
+					request$,
+					itemStore,
+					initial,
+					evaluationAttachmentIdentity,
+					clientToolExecutions,
+					evaluationClientToolControllers,
+					startedClientToolCalls,
+					evaluationRequestRemovalHandlers,
+					releaseClientToolExecution,
+				);
 				return;
 			}
 
@@ -2632,59 +2697,172 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		request$: IObservable<ObservedSessionInputRequest>,
 		itemStore: DisposableStore,
 		initial: ClientToolExecutionRequest,
+		attachmentIdentity: IAgentHostEvaluationSessionIdentity,
+		clientToolExecutions: Map<string, IClientToolExecution>,
+		controllers: Map<string, IEvaluationClientToolController>,
 		startedClientToolCalls: Set<string>,
-		clientToolExecutions: Map<string, { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }>,
-		releaseClientToolExecution: (key: string, execution: { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }) => void,
+		requestRemovalHandlers: Map<string, (requests: readonly ObservedSessionInputRequest[]) => void>,
+		releaseClientToolExecution: (key: string, execution: IClientToolExecution) => void,
 	): void {
 		const key = this._toolCallKey(initial.chat.toString(), initial.turnId, initial.toolCall.toolCallId);
-		const requestLifecycle = itemStore.add(new MutableDisposable<IDisposable>());
-		itemStore.add(this._retainToolCall(key));
-
-		let execution = clientToolExecutions.get(key);
-		if (!execution) {
-			execution = { source: new CancellationTokenSource(), retain: this._retainToolCall(key), activeAttempts: 0 };
-			clientToolExecutions.set(key, execution);
+		if (startedClientToolCalls.has(key)) {
+			return;
 		}
-		const targetsConfirmation = initial.toolCall.status === ToolCallStatus.PendingConfirmation;
-		requestLifecycle.value = toDisposable(() => {
-			const state = this._clientToolInvocations.get(key)?.state.get();
-			const targetsState = state?.type === IChatToolInvocation.StateKind.Streaming
-				|| state?.type === (targetsConfirmation
-					? IChatToolInvocation.StateKind.WaitingForConfirmation
-					: IChatToolInvocation.StateKind.Executing)
-				|| (execution.activeAttempts > 0
-					&& (state?.type === IChatToolInvocation.StateKind.Cancelled
-						|| state?.type === IChatToolInvocation.StateKind.Completed));
-			const hasApprovedSuccessor = targetsConfirmation && invocationStarted
-				&& requests.get().some(candidate => this._isOwnedClientToolRequest(candidate)
-					&& candidate.toolCall.status === ToolCallStatus.Running
-					&& this._toolCallKey(candidate.chat.toString(), candidate.turnId, candidate.toolCall.toolCallId) === key
-					&& getClientToolPreApproval(candidate.toolCall) !== undefined);
-			const approvedBeforeRemoval = targetsConfirmation
-				&& (state?.type === IChatToolInvocation.StateKind.Executing || hasApprovedSuccessor);
-			if (approvedBeforeRemoval) {
+		const helperStore = itemStore.add(new DisposableStore());
+		const requestLifecycle = helperStore.add(new MutableDisposable<IDisposable>());
+		helperStore.add(this._retainToolCall(key));
+
+		let controller = controllers.get(key);
+		if (!controller) {
+			if (clientToolExecutions.has(key)) {
+				return;
+			}
+			const execution: IClientToolExecution = {
+				source: new CancellationTokenSource(),
+				retain: this._retainToolCall(key),
+				activeAttempts: 0,
+			};
+			clientToolExecutions.set(key, execution);
+			controller = {
+				execution,
+				generation: observableValue(`evaluationClientTool:${key}`, 0),
+				owner: undefined,
+				requestId: undefined,
+				invocationStarted: false,
+				completed: false,
+				awaitingSuccessor: false,
+				fromConfirmation: false,
+				handoffTimer: new MutableDisposable<IDisposable>(),
+			};
+			controllers.set(key, controller);
+		}
+		const execution = controller.execution;
+		const isSemanticRequest = (candidate: ObservedSessionInputRequest): candidate is ClientToolExecutionRequest =>
+			this._isOwnedClientToolRequest(candidate)
+			&& this._toolCallKey(candidate.chat.toString(), candidate.turnId, candidate.toolCall.toolCallId) === key;
+		const otherRequests = (currentRequests: readonly ObservedSessionInputRequest[] = requests.get()) =>
+			currentRequests.filter(candidate => candidate.id !== initial.id);
+		const survivingRequests = (currentRequests?: readonly ObservedSessionInputRequest[]) =>
+			otherRequests(currentRequests).filter(isSemanticRequest);
+		const wake = () => controller.generation.set(controller.generation.get() + 1, undefined);
+		let attachmentEnded = false;
+		itemStore.add(this._evaluationSessionAttachmentService.onDidChangeAttachment(changed => {
+			if (changed.connectionAuthority === attachmentIdentity.connectionAuthority
+				&& changed.backendSession.toString() === attachmentIdentity.backendSession.toString()
+				&& !this._evaluationSessionAttachmentService.isAttached(attachmentIdentity)) {
+				attachmentEnded = true;
 				startedClientToolCalls.add(key);
-			} else {
-				if (targetsState) {
+				helperStore.dispose();
+			}
+		}));
+
+		const releaseController = (cancel: boolean) => {
+			if (controllers.get(key) !== controller) {
+				return;
+			}
+			controllers.delete(key);
+			controller.handoffTimer.dispose();
+			if (cancel) {
+				execution.source.cancel();
+			}
+			releaseClientToolExecution(key, execution);
+		};
+		const scheduleHandoffTimeout = () => {
+			if (!controller.invocationStarted) {
+				controller.owner = undefined;
+			}
+			controller.requestId = undefined;
+			controller.awaitingSuccessor = true;
+			controller.handoffTimer.value = disposableTimeout(
+				() => releaseController(true),
+				EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS,
+			);
+		};
+
+		let requestEnded = false;
+		const handleRequestEnd = (currentRequests: readonly ObservedSessionInputRequest[]) => {
+			if (requestEnded) {
+				return;
+			}
+			requestEnded = true;
+			if (controllers.get(key) !== controller) {
+				return;
+			}
+			if (attachmentEnded) {
+				releaseController(true);
+				return;
+			}
+			const survivors = survivingRequests(currentRequests);
+			if (controller.completed) {
+				if (survivors.length === 0) {
+					releaseController(false);
+				}
+				return;
+			}
+			const state = this._clientToolInvocations.get(key)?.state.get();
+			if (state?.type === IChatToolInvocation.StateKind.Cancelled
+				|| state?.type === IChatToolInvocation.StateKind.Completed) {
+				controller.completed = true;
+				controller.owner = undefined;
+				controller.handoffTimer.dispose();
+				if (state.type === IChatToolInvocation.StateKind.Cancelled) {
 					execution.source.cancel();
 				}
 				releaseClientToolExecution(key, execution);
+				if (survivors.length === 0) {
+					controllers.delete(key);
+				} else {
+					wake();
+				}
+				return;
 			}
-		});
+			if (controller.requestId !== initial.id) {
+				return;
+			}
+			const successor = survivors.find(candidate => candidate.toolCall.status === ToolCallStatus.Running);
+			if (controller.invocationStarted) {
+				if (successor) {
+					controller.requestId = successor.id;
+					controller.awaitingSuccessor = false;
+					controller.fromConfirmation = false;
+					controller.handoffTimer.clear();
+					wake();
+				} else {
+					scheduleHandoffTimeout();
+				}
+				return;
+			}
+			const survivor = successor ?? survivors[0];
+			if (survivor) {
+				controller.owner = undefined;
+				controller.requestId = survivor.id;
+				controller.awaitingSuccessor = false;
+				controller.fromConfirmation = survivor.toolCall.status === ToolCallStatus.PendingConfirmation;
+				controller.handoffTimer.clear();
+				wake();
+				return;
+			}
+			scheduleHandoffTimeout();
+		};
+		requestRemovalHandlers.set(initial.id, handleRequestEnd);
+		itemStore.add(toDisposable(() => requestRemovalHandlers.delete(initial.id)));
+		requestLifecycle.value = toDisposable(() => handleRequestEnd(requests.get()));
 
 		let generation = 0;
 		let observedRequest: ClientToolExecutionRequest | undefined;
 		let startedRequest: ClientToolExecutionRequest | undefined;
-		let invocationStarted = false;
-		const unobservedTimer = itemStore.add(new MutableDisposable<IDisposable>());
-		itemStore.add(autorun(reader => {
+		const unobservedTimer = helperStore.add(new MutableDisposable<IDisposable>());
+		helperStore.add(autorun(reader => {
+			controller.generation.read(reader);
+			if (requestEnded) {
+				return;
+			}
 			const request = request$.read(reader);
 			if (!this._isOwnedClientToolRequest(request)
 				|| this._toolCallKey(request.chat.toString(), request.turnId, request.toolCall.toolCallId) !== key) {
 				generation++;
 				observedRequest = undefined;
 				startedRequest = undefined;
-				invocationStarted = false;
 				unobservedTimer.clear();
 				return;
 			}
@@ -2695,19 +2873,30 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				: undefined;
 			const invocation = this._clientToolInvocations.get(key);
 			if (externalConfirmation && invocation && !IChatToolInvocation.executionConfirmedOrDenied(invocation)) {
+				this._externalClientToolConfirmations.add(key);
 				IChatToolInvocation.confirmWith(invocation, externalConfirmation);
 			}
+			if (invocation?.state.read(reader).type === IChatToolInvocation.StateKind.Cancelled) {
+				controller.completed = true;
+				controller.owner = undefined;
+				startedClientToolCalls.add(key);
+				releaseController(true);
+				return;
+			}
 
-			if (startedClientToolCalls.has(key)) {
+			if (request.toolCall.status === ToolCallStatus.Running && controller.awaitingSuccessor) {
+				controller.requestId = request.id;
+				controller.awaitingSuccessor = false;
+				controller.fromConfirmation = false;
+				controller.handoffTimer.clear();
+			}
+			if (controller.completed || controller.invocationStarted) {
 				startedRequest = request;
 				unobservedTimer.clear();
 				return;
 			}
 			if (!equals(observedRequest, request)) {
 				observedRequest = request;
-				if (invocationStarted) {
-					return;
-				}
 				generation++;
 				startedRequest = undefined;
 				unobservedTimer.clear();
@@ -2720,6 +2909,24 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				return;
 			}
 			const execute = (contextSessionResource: URI | undefined) => {
+				if (controller.completed || controller.invocationStarted) {
+					return;
+				}
+				const owner = {};
+				if (controller.owner && controller.requestId !== request.id) {
+					return;
+				}
+				if (controller.requestId !== undefined
+					&& controller.requestId !== request.id
+					&& !controller.awaitingSuccessor
+					&& !controller.fromConfirmation) {
+					return;
+				}
+				controller.owner = owner;
+				controller.requestId = request.id;
+				controller.awaitingSuccessor = false;
+				controller.fromConfirmation = request.toolCall.status === ToolCallStatus.PendingConfirmation;
+				controller.handoffTimer.clear();
 				startedRequest = request;
 				unobservedTimer.clear();
 				const requestGeneration = generation;
@@ -2728,18 +2935,33 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 					request,
 					contextSessionResource,
 					execution.source.token,
-					() => requestGeneration === generation && (invocationStarted || equals(request$.read(undefined), request)),
+					() => controllers.get(key) === controller
+						&& controller.owner === owner
+						&& requestGeneration === generation
+						&& (controller.invocationStarted || equals(request$.read(undefined), request)),
 					() => {
-						if (requestGeneration === generation) {
-							invocationStarted = true;
-							if (request.toolCall.status !== ToolCallStatus.PendingConfirmation) {
-								startedClientToolCalls.add(key);
-							}
+						if (controllers.get(key) === controller && controller.owner === owner && requestGeneration === generation) {
+							controller.invocationStarted = true;
 						}
 					},
 				).finally(() => {
 					execution.activeAttempts--;
 					const invocation = this._clientToolInvocations.get(key);
+					if (controllers.get(key) === controller && invocation && IChatToolInvocation.isComplete(invocation)) {
+						controller.completed = true;
+						controller.owner = undefined;
+						controller.handoffTimer.dispose();
+						releaseClientToolExecution(key, execution);
+						if (survivingRequests().length === 0) {
+							controllers.delete(key);
+						} else {
+							wake();
+						}
+						if (execution.activeAttempts === 0 && clientToolExecutions.get(key) !== execution) {
+							execution.source.dispose();
+						}
+						return;
+					}
 					if (execution.activeAttempts === 0 && invocation && IChatToolInvocation.isComplete(invocation)) {
 						releaseClientToolExecution(key, execution);
 					} else if (execution.activeAttempts === 0 && clientToolExecutions.get(key) !== execution) {
@@ -2754,10 +2976,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			} else if (!unobservedTimer.value) {
 				const requestGeneration = generation;
 				unobservedTimer.value = disposableTimeout(() => {
-					if (requestGeneration === generation && !startedRequest) {
+					if (requestGeneration === generation && !startedRequest && !controller.completed && !controller.invocationStarted) {
 						startedRequest = request;
-						startedClientToolCalls.add(key);
+						controller.completed = true;
+						controller.owner = undefined;
 						this._denyClientTool(request);
+						releaseClientToolExecution(key, execution);
+						wake();
 					}
 				}, UNOBSERVED_CLIENT_TOOL_GRACE_MS);
 			}
@@ -2808,6 +3033,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			}
 			this._clientToolRetainCounts.delete(key);
 			this._forgetResolvedToolCall(key);
+			this._externalClientToolConfirmations.delete(key);
 			this._clientToolInvocations.delete(key);
 		});
 	}
@@ -4367,6 +4593,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 	): void {
 		const toolCallId = initial.toolCallId;
 		const toolName = initial.toolName;
+		const toolCallKey = this._toolCallKey(opts.chatURI, opts.turnId, toolCallId);
 
 		// Reconnect adoption: settle any snapshot invocation so the shared
 		// invocation can take over the UI slot rather than leaving the old
@@ -4436,6 +4663,9 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			}
 			if (state.type === IChatToolInvocation.StateKind.Executing) {
 				confirmationDispatched = true;
+				if (this._externalClientToolConfirmations.has(toolCallKey)) {
+					return;
+				}
 				const selectedOptionId = state.confirmed.type === ToolConfirmKind.UserAction ? state.confirmed.selectedButton : undefined;
 				const approved = state.confirmed.type !== ToolConfirmKind.UserAction
 					|| state.confirmed.selectedButtonKind !== ConfirmationOptionKind.Deny;

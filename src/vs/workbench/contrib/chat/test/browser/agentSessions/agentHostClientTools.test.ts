@@ -21,7 +21,7 @@ import { runWithFakedTimers } from '../../../../../../base/test/common/timeTrave
 import { ILogService, NullLogService } from '../../../../../../platform/log/common/log.js';
 import { IConfigurationChangeEvent, IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { AgentSession, IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
-import { AgentHostEvaluationSessionAttachmentService, IAgentHostEvaluationSessionAttachmentService } from '../../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
+import { AgentHostEvaluationSessionAttachmentService, IAgentHostEvaluationSessionAttachmentService, type IAgentHostEvaluationSessionIdentity } from '../../../../../../platform/agentHost/common/agentHostEvaluationSessionAttachment.js';
 import { CLIENT_SEMANTIC_SEARCH_REFERENCE_NAME, CLIENT_SEMANTIC_SEARCH_TOOL_ID, CopilotSemanticSearchEnabledSettingId, SEMANTIC_SEARCH_TOOL_NAME } from '../../../../../../platform/agentHost/common/semanticSearchConstants.js';
 import { CLIENT_TOOL_SEARCH_REFERENCE_NAME, RUNTIME_TOOL_SEARCH_TOOL_NAME } from '../../../../../../platform/agentHost/common/toolSearchConstants.js';
 import { isChatAction, isSessionAction, type ActionEnvelope, type ChatAction, type IRootConfigChangedAction, type SessionAction, type TerminalAction, type INotification, type ClientAnnotationsAction } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
@@ -41,7 +41,7 @@ import { IProductService } from '../../../../../../platform/product/common/produ
 import { TestInstantiationService } from '../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { IWorkspaceContextService } from '../../../../../../platform/workspace/common/workspace.js';
 import { IConfigurationResolverService } from '../../../../../services/configurationResolver/common/configurationResolver.js';
-import { AgentHostSessionHandler, toolDataToDefinition, toolResultToProtocol, UNOBSERVED_CLIENT_TOOL_GRACE_MS } from '../../../browser/agentSessions/agentHost/agentHostSessionHandler.js';
+import { AgentHostSessionHandler, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS, toolDataToDefinition, toolResultToProtocol, UNOBSERVED_CLIENT_TOOL_GRACE_MS } from '../../../browser/agentSessions/agentHost/agentHostSessionHandler.js';
 import { AgentHostActiveClientService, IAgentHostActiveClientService } from '../../../browser/agentSessions/agentHost/agentHostActiveClientService.js';
 import { IAgentHostCustomizationService, NullAgentHostCustomizationService } from '../../../browser/agentSessions/agentHost/agentHostCustomizationService.js';
 import { AGENT_HOST_COPILOT_CLI_SESSION_TYPE, IAgentHostToolSetEnablementService, IToolEnablementState } from '../../../browser/agentSessions/agentHost/agentHostToolSetEnablementService.js';
@@ -77,7 +77,14 @@ import { IUriIdentityService } from '../../../../../../platform/uriIdentity/comm
 // Unit tests for toolDataToDefinition and toolResultToProtocol
 // =============================================================================
 
-const EVALUATION_SESSION_RESOURCE = URI.from({ scheme: 'remote-local-copilot', path: '/session-1' });
+const EVALUATION_SESSION_IDENTITY: IAgentHostEvaluationSessionIdentity = {
+	connectionAuthority: 'local',
+	backendSession: AgentSession.uri('copilot', 'session-1'),
+};
+const EVALUATION_ALIAS_SESSION_IDENTITY: IAgentHostEvaluationSessionIdentity = {
+	connectionAuthority: 'local',
+	backendSession: AgentSession.uri('backend-alias', 'session-1'),
+};
 
 suite('AgentHostClientTools', () => {
 
@@ -720,10 +727,11 @@ suite('AgentHostClientTools', () => {
 			tools: IToolData[],
 			toolServiceOptions?: { requireConfirmation?: boolean; throwBeforeConfirmation?: Error; invokeResult?: DeferredPromise<IToolResult> },
 			sessionType: string = AGENT_HOST_COPILOT_CLI_SESSION_TYPE,
+			backendSessionScheme?: string,
 		) {
 			const instantiationService = disposables.add(new TestInstantiationService());
 			const connection = new MockAgentHostConnection();
-			const evaluationSessionAttachmentService = new AgentHostEvaluationSessionAttachmentService();
+		const evaluationSessionAttachmentService = disposables.add(new AgentHostEvaluationSessionAttachmentService());
 
 			const toolsService = createMockToolsService(disposables, tools, toolServiceOptions);
 			const configValues: Record<string, unknown> = {};
@@ -863,6 +871,7 @@ suite('AgentHostClientTools', () => {
 				description: 'Test',
 				connection,
 				connectionAuthority: 'local',
+				backendSessionScheme,
 			}));
 
 			return { handler, connection, toolsService, evaluationSessionAttachmentService, configValues, onDidChangeConfig };
@@ -1006,11 +1015,13 @@ suite('AgentHostClientTools', () => {
 				confirmed?: ToolCallConfirmationReason;
 				_meta?: Record<string, unknown>;
 			},
+			requestId = `exec-${toolCall.toolCallId}`,
+			backendSession = AgentSession.uri('copilot', 'session-1'),
 		): void {
-			connection.applySessionAction(URI.parse(AgentSession.uri('copilot', 'session-1').toString()), {
+			connection.applySessionAction(backendSession, {
 				type: ActionType.SessionInputNeededSet,
 				request: {
-					id: `exec-${toolCall.toolCallId}`,
+					id: requestId,
 					kind: SessionInputRequestKind.ToolClientExecution,
 					clientId: connection.clientId,
 					chat,
@@ -1750,10 +1761,14 @@ suite('AgentHostClientTools', () => {
 			);
 		});
 
-		async function provideSessionWithPendingConfirmationClientTool(handler: AgentHostSessionHandler, connection: MockAgentHostConnection): Promise<URI> {
+		async function provideSessionWithPendingConfirmationClientTool(
+			handler: AgentHostSessionHandler,
+			connection: MockAgentHostConnection,
+			additionalRequestIds: readonly string[] = [],
+			backendSession = AgentSession.uri('copilot', 'session-1'),
+		): Promise<URI> {
 			const sessionResource = URI.parse('agent-host-copilot:/session-1');
-			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
-			const chatURI = URI.parse(buildDefaultChatUri(backendSession));
+			const chatURI = URI.parse(buildDefaultChatUri(backendSession.toString()));
 
 			connection.applySessionAction(chatURI, {
 				type: ActionType.ChatTurnStarted,
@@ -1783,25 +1798,27 @@ suite('AgentHostClientTools', () => {
 			} as ChatAction);
 
 			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
-			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
-				type: ActionType.SessionInputNeededSet,
-				request: {
-					id: 'confirmation-tool-call-1',
-					kind: SessionInputRequestKind.ToolConfirmation,
-					chat: chatURI.toString(),
-					turnId: 'turn-1',
-					toolCall: {
-						status: ToolCallStatus.PendingConfirmation,
-						toolCallId: 'tool-call-1',
-						toolName: 'runTask',
-						displayName: 'Run Task',
-						invocationMessage: 'Run Task',
-						toolInput: '{"task":"build"}',
-						confirmationTitle: 'Run Task',
-						contributor: { kind: ToolCallContributorKind.Client, clientId: connection.clientId },
+			for (const requestId of ['confirmation-tool-call-1', ...additionalRequestIds]) {
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededSet,
+					request: {
+						id: requestId,
+						kind: SessionInputRequestKind.ToolConfirmation,
+						chat: chatURI.toString(),
+						turnId: 'turn-1',
+						toolCall: {
+							status: ToolCallStatus.PendingConfirmation,
+							toolCallId: 'tool-call-1',
+							toolName: 'runTask',
+							displayName: 'Run Task',
+							invocationMessage: 'Run Task',
+							toolInput: '{"task":"build"}',
+							confirmationTitle: 'Run Task',
+							contributor: { kind: ToolCallContributorKind.Client, clientId: connection.clientId },
+						},
 					},
-				},
-			});
+				});
+			}
 			await timeout(0);
 			await timeout(0);
 			return chatURI;
@@ -1987,7 +2004,7 @@ suite('AgentHostClientTools', () => {
 		test('empty attachment service keeps current-main cancellation behavior after external approval', async () => {
 			const invokeResult = new DeferredPromise<IToolResult>();
 			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			assert.strictEqual(evaluationSessionAttachmentService.isAttached(AgentSession.uri('copilot', 'session-1')), false);
+			assert.strictEqual(evaluationSessionAttachmentService.isAttached(EVALUATION_SESSION_IDENTITY), false);
 			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
 
 			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
@@ -2022,14 +2039,15 @@ suite('AgentHostClientTools', () => {
 		});
 
 		test('wrong or sibling backend attachment keeps current-main cancellation behavior', async () => {
-			for (const resource of [
-				URI.from({ scheme: 'remote-local-copilot', path: '/session-2' }),
-				URI.from({ scheme: 'remote-local-other', path: '/session-1' }),
+			for (const identity of [
+				{ ...EVALUATION_SESSION_IDENTITY, connectionAuthority: 'other' },
+				{ ...EVALUATION_SESSION_IDENTITY, backendSession: AgentSession.uri('copilot', 'session-2') },
+				{ ...EVALUATION_SESSION_IDENTITY, backendSession: AgentSession.uri('other', 'session-1') },
 			]) {
 				const local = disposables.add(new DisposableStore());
 				const invokeResult = new DeferredPromise<IToolResult>();
 				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(local, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-				local.add(evaluationSessionAttachmentService.register(resource));
+				local.add(evaluationSessionAttachmentService.register(identity));
 				const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
 				applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
 					toolCallId: 'tool-call-1', toolName: 'runTask', displayName: 'Run Task',
@@ -2053,7 +2071,7 @@ suite('AgentHostClientTools', () => {
 		test('disposing the exact attachment immediately restores current-main behavior', async () => {
 			const invokeResult = new DeferredPromise<IToolResult>();
 			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			const registration = evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE);
+			const registration = evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY);
 			registration.dispose();
 			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
 			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
@@ -2072,10 +2090,66 @@ suite('AgentHostClientTools', () => {
 			invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
 		});
 
+		test('registration appearing after an ordinary request exists does not replace its watcher', async () => {
+			const invokeResult = new DeferredPromise<IToolResult>();
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"build"}',
+				confirmed: ToolCallConfirmationReason.UserAction,
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.strictEqual(toolsService.begunToolCalls[0]?.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
+			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+				type: ActionType.SessionInputNeededRemoved,
+				id: 'confirmation-tool-call-1',
+			});
+			await timeout(0);
+			assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, true);
+			invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
+		});
+
+		test('attachment disposal stops the helper for an existing request', async () => {
+			const invokeResult = new DeferredPromise<IToolResult>();
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+			const registration = evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY);
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+
+			registration.dispose();
+			await timeout(0);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"build"}',
+				confirmed: ToolCallConfirmationReason.UserAction,
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+				executed: toolsService.executedToolCalls.length,
+			}, {
+				cancelled: true,
+				executed: 0,
+			});
+			invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
+		});
+
 		test('exact attached backend preserves external approval handoff and terminal completion', async () => {
 			const invokeResult = new DeferredPromise<IToolResult>();
 			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE));
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
 			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
 
 			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
@@ -2108,49 +2182,185 @@ suite('AgentHostClientTools', () => {
 				&& entry.action.toolCallId === 'tool-call-1').length, 1);
 		});
 
-		test('wrong chat, turn, or call cannot use the attached-session handoff', async () => {
-			const successors = [
-				{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-2').toString()), turnId: 'turn-1', toolCallId: 'tool-call-1' },
-				{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-1').toString()), turnId: 'turn-2', toolCallId: 'tool-call-1' },
-				{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-1').toString()), turnId: 'turn-1', toolCallId: 'tool-call-2' },
-			];
+		test('exact backend scheme alias uses the attached-session helper', async () => {
+			const invokeResult = new DeferredPromise<IToolResult>();
+			const aliasBackendSession = EVALUATION_ALIAS_SESSION_IDENTITY.backendSession;
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(
+				disposables,
+				[testRunTaskTool],
+				{ requireConfirmation: true, invokeResult },
+				AGENT_HOST_COPILOT_CLI_SESSION_TYPE,
+				aliasBackendSession.scheme,
+			);
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_ALIAS_SESSION_IDENTITY));
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection, [], aliasBackendSession);
 
-			for (const successor of successors) {
-				const local = disposables.add(new DisposableStore());
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"build"}',
+				confirmed: ToolCallConfirmationReason.UserAction,
+			}, undefined, aliasBackendSession);
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				state: toolsService.begunToolCalls[0]?.state.get().type,
+				cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+				invocations: toolsService.invokedToolCalls.length,
+			}, {
+				state: IChatToolInvocation.StateKind.Executing,
+				cancelled: false,
+				invocations: 1,
+			});
+			invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+			await timeout(0);
+		});
+
+		test('attached confirmation adopts a delayed running successor beyond a microtask', async () => {
+			const invokeResult = new DeferredPromise<IToolResult>();
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+
+			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+				type: ActionType.SessionInputNeededRemoved,
+				id: 'confirmation-tool-call-1',
+			});
+			await timeout(10);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"build"}',
+				confirmed: ToolCallConfirmationReason.UserAction,
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				state: toolsService.begunToolCalls[0]?.state.get().type,
+				invocations: toolsService.invokedToolCalls.length,
+				executions: toolsService.executedToolCalls.length,
+			}, {
+				state: IChatToolInvocation.StateKind.Executing,
+				invocations: 1,
+				executions: 1,
+			});
+			invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+			await timeout(0);
+		});
+
+		test('attached confirmation without a running successor times out and releases execution', async () => {
+			await runWithFakedTimers({}, async () => {
 				const invokeResult = new DeferredPromise<IToolResult>();
-				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(local, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-				local.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE));
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
 				await provideSessionWithPendingConfirmationClientTool(handler, connection);
 
-				applyRunningClientExecution(connection, successor.chat, successor.turnId, {
-					toolCallId: successor.toolCallId,
-					toolName: 'runTask',
-					displayName: 'Run Task',
-					invocationMessage: 'Run Task',
-					toolInput: '{"task":"build"}',
-					confirmed: ToolCallConfirmationReason.UserAction,
-				});
-				await timeout(0);
-				await timeout(0);
-
-				assert.strictEqual(toolsService.begunToolCalls[0]?.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
 				connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
 					type: ActionType.SessionInputNeededRemoved,
 					id: 'confirmation-tool-call-1',
 				});
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
 				await timeout(0);
-				assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, true);
+
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					executed: toolsService.executedToolCalls.length,
+				}, {
+					cancelled: true,
+					executed: 0,
+				});
 				invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
-				local.dispose();
-				disposables.delete(local);
-			}
+			});
 		});
 
-		test('duplicate attached-session approval executes and completes exactly once', async () => {
+		test('attached explicit denial releases its reservation and leaves a distinct call unaffected', async () => {
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true });
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+
+			connection.applySessionAction(chatURI, {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId: 'turn-1',
+				toolCallId: 'tool-call-1',
+				approved: false,
+				reason: ToolCallCancellationReason.Skipped,
+				reasonMessage: 'Run Task was skipped',
+			});
+			await timeout(0);
+			await timeout(0);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-2', {
+				toolCallId: 'tool-call-2',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"other"}',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				deniedCancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+				executedCallIds: toolsService.executedToolCalls.map(call => call.callId),
+			}, {
+				deniedCancelled: true,
+				executedCallIds: ['tool-call-2'],
+			});
+		});
+
+		test('wrong chat, turn, or call cannot use the attached-session handoff', async () => {
+			await runWithFakedTimers({}, async () => {
+				const successors = [
+					{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-2').toString()), turnId: 'turn-1', toolCallId: 'tool-call-1' },
+					{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-1').toString()), turnId: 'turn-2', toolCallId: 'tool-call-1' },
+					{ chat: buildDefaultChatUri(AgentSession.uri('copilot', 'session-1').toString()), turnId: 'turn-1', toolCallId: 'tool-call-2' },
+				];
+
+				for (const successor of successors) {
+					const local = disposables.add(new DisposableStore());
+					const invokeResult = new DeferredPromise<IToolResult>();
+					const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(local, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+					local.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+					await provideSessionWithPendingConfirmationClientTool(handler, connection);
+
+					applyRunningClientExecution(connection, successor.chat, successor.turnId, {
+						toolCallId: successor.toolCallId,
+						toolName: 'runTask',
+						displayName: 'Run Task',
+						invocationMessage: 'Run Task',
+						toolInput: '{"task":"build"}',
+						confirmed: ToolCallConfirmationReason.UserAction,
+					});
+					await timeout(0);
+					await timeout(0);
+
+					assert.strictEqual(toolsService.begunToolCalls[0]?.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
+					connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+						type: ActionType.SessionInputNeededRemoved,
+						id: 'confirmation-tool-call-1',
+					});
+					await timeout(0);
+					assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, false);
+					await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+					assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, true);
+					invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
+					local.dispose();
+					disposables.delete(local);
+				}
+			});
+		});
+
+		test('distinct pending ids and their running successors execute and complete exactly once', async () => {
 			const invokeResult = new DeferredPromise<IToolResult>();
 			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE));
-			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection, ['confirmation-tool-call-1-duplicate']);
 			const approved = {
 				toolCallId: 'tool-call-1',
 				toolName: 'runTask',
@@ -2160,8 +2370,16 @@ suite('AgentHostClientTools', () => {
 				confirmed: ToolCallConfirmationReason.UserAction,
 			};
 
-			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', approved);
-			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', approved);
+			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+				type: ActionType.SessionInputNeededRemoved,
+				id: 'confirmation-tool-call-1',
+			});
+			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+				type: ActionType.SessionInputNeededRemoved,
+				id: 'confirmation-tool-call-1-duplicate',
+			});
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', approved, 'running-tool-call-1');
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', approved, 'running-tool-call-1-duplicate');
 			await timeout(0);
 			await timeout(0);
 			assert.strictEqual(toolsService.invokedToolCalls.filter(invocation => invocation.chatStreamToolCallId === 'tool-call-1').length, 1);
@@ -2174,10 +2392,378 @@ suite('AgentHostClientTools', () => {
 				&& entry.action.toolCallId === 'tool-call-1').length, 1);
 		});
 
+		test('distinct running ids for one attached semantic call execute and complete exactly once', async () => {
+			const invokeResult = new DeferredPromise<IToolResult>();
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const sessionResource = URI.parse('agent-host-copilot:/session-1');
+			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
+			const chat = buildDefaultChatUri(backendSession);
+			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+			const toolCall = {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: '{"task":"build"}',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			};
+
+			applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-tool-call-1');
+			applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-tool-call-1-duplicate');
+			await timeout(0);
+			await timeout(0);
+			assert.strictEqual(toolsService.invokedToolCalls.filter(invocation => invocation.chatStreamToolCallId === 'tool-call-1').length, 1);
+
+			invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+			await timeout(0);
+			await timeout(0);
+			assert.strictEqual(connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+				&& entry.action.type === ActionType.ChatToolCallComplete
+				&& entry.action.toolCallId === 'tool-call-1').length, 1);
+		});
+
+		test('attached running removal cancels its owned execution after the bounded handoff', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const sessionResource = URI.parse('agent-host-copilot:/session-1');
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+				const chat = buildDefaultChatUri(backendSession.toString());
+				await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+
+				applyRunningClientExecution(connection, chat, 'turn-1', {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"build"}',
+				}, 'running-owner');
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, false);
+
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'running-owner',
+				});
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					invocations: toolsService.invokedToolCalls.length,
+					completions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallComplete
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, {
+					cancelled: true,
+					invocations: 1,
+					completions: 0,
+				});
+				invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+					&& entry.action.type === ActionType.ChatToolCallComplete
+					&& entry.action.toolCallId === 'tool-call-1').length, 0);
+			});
+		});
+
+		test('attached running removal adopts one delayed matching running successor', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const sessionResource = URI.parse('agent-host-copilot:/session-1');
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+				const chat = buildDefaultChatUri(backendSession.toString());
+				const toolCall = {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"build"}',
+				};
+				await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+
+				applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-owner');
+				await timeout(0);
+				await timeout(0);
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'running-owner',
+				});
+				await timeout(10);
+				applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-successor');
+				await timeout(0);
+				await timeout(0);
+
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					invocations: toolsService.invokedToolCalls.length,
+				}, {
+					cancelled: false,
+					invocations: 1,
+				});
+				invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+					&& entry.action.type === ActionType.ChatToolCallComplete
+					&& entry.action.toolCallId === 'tool-call-1').length, 1);
+			});
+		});
+
+		test('attached running removal without a successor times out and leaves no reservation', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const sessionResource = URI.parse('agent-host-copilot:/session-1');
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+				const chat = buildDefaultChatUri(backendSession.toString());
+				const toolCall = {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"build"}',
+				};
+				await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+
+				applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-abandoned');
+				await timeout(0);
+				await timeout(0);
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'running-abandoned',
+				});
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+
+				applyRunningClientExecution(connection, chat, 'turn-1', toolCall, 'running-later');
+				await timeout(0);
+				await timeout(0);
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens.map(token => token.isCancellationRequested),
+					invocations: toolsService.invokedToolCalls.length,
+				}, {
+					cancelled: [true, false],
+					invocations: 2,
+				});
+
+				invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+					&& entry.action.type === ActionType.ChatToolCallComplete
+					&& entry.action.toolCallId === 'tool-call-1').length, 1);
+			});
+		});
+
+		test('attached running completion before removal remains one completion', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const sessionResource = URI.parse('agent-host-copilot:/session-1');
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+				const chat = buildDefaultChatUri(backendSession.toString());
+				await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+
+				applyRunningClientExecution(connection, chat, 'turn-1', {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"build"}',
+				}, 'running-owner');
+				await timeout(0);
+				await timeout(0);
+				invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+				await timeout(0);
+				await timeout(0);
+
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'running-owner',
+				});
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					invocations: toolsService.invokedToolCalls.length,
+					completions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallComplete
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, {
+					cancelled: false,
+					invocations: 1,
+					completions: 1,
+				});
+			});
+		});
+
+		test('attached request update during referenced-input resolution executes the latest request once', async () => {
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const sessionResource = URI.parse('agent-host-copilot:/session-1');
+			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
+			const chatURI = URI.parse(buildDefaultChatUri(backendSession));
+			const firstInputURI = URI.parse('session-db:/attached-tool-input-1');
+			const secondInputURI = URI.parse('session-db:/attached-tool-input-2');
+			const firstInput = { uri: firstInputURI.toString(), contentType: 'application/json' };
+			const secondInput = { uri: secondInputURI.toString(), contentType: 'application/json' };
+			connection.resourceReadResponses.set(firstInputURI.toString(), new DeferredPromise<{ data: string; encoding: ContentEncoding }>().p);
+			connection.resourceReadResponses.set(secondInputURI.toString(), Promise.resolve({
+				data: '{"task":"latest"}',
+				encoding: ContentEncoding.Utf8,
+			}));
+
+			applyReferencedRunTask(connection, chatURI, firstInput, ToolCallConfirmationReason.NotNeeded);
+			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: firstInput,
+			});
+			await timeout(0);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: secondInput,
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				resourceReadUris: connection.resourceReadUris.map(uri => uri.toString()),
+				invocations: toolsService.invokedToolCalls.map(call => ({ callId: call.callId, parameters: call.parameters })),
+			}, {
+				resourceReadUris: [firstInputURI.toString(), secondInputURI.toString()],
+				invocations: [{ callId: 'tool-call-1', parameters: { task: 'latest' } }],
+			});
+		});
+
+		test('removed unresolved owner transfers and wakes a surviving different-id running request', async () => {
+			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+			const sessionResource = URI.parse('agent-host-copilot:/session-1');
+			const backendSession = AgentSession.uri('copilot', 'session-1');
+			const chatURI = URI.parse(buildDefaultChatUri(backendSession.toString()));
+			const firstInputURI = URI.parse('session-db:/attached-owner-input');
+			const survivorInputURI = URI.parse('session-db:/attached-survivor-input');
+			const firstInput = { uri: firstInputURI.toString(), contentType: 'application/json' };
+			const survivorInput = { uri: survivorInputURI.toString(), contentType: 'application/json' };
+			const unresolvedInput = new DeferredPromise<{ data: string; encoding: ContentEncoding }>();
+			connection.resourceReadResponses.set(firstInputURI.toString(), unresolvedInput.p);
+			connection.resourceReadResponses.set(survivorInputURI.toString(), Promise.resolve({
+				data: '{"task":"survivor"}',
+				encoding: ContentEncoding.Utf8,
+			}));
+
+			applyReferencedRunTask(connection, chatURI, firstInput, ToolCallConfirmationReason.NotNeeded);
+			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: firstInput,
+			}, 'running-owner');
+			await timeout(0);
+			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+				toolCallId: 'tool-call-1',
+				toolName: 'runTask',
+				displayName: 'Run Task',
+				invocationMessage: 'Run Task',
+				toolInput: survivorInput,
+			}, 'running-survivor');
+			await timeout(0);
+			assert.deepStrictEqual(connection.resourceReadUris.map(uri => uri.toString()), [firstInputURI.toString()]);
+
+			connection.applySessionAction(backendSession, {
+				type: ActionType.SessionInputNeededRemoved,
+				id: 'running-owner',
+			});
+			await timeout(0);
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				resourceReadUris: connection.resourceReadUris.map(uri => uri.toString()),
+				invocations: toolsService.invokedToolCalls.map(call => ({ callId: call.callId, parameters: call.parameters })),
+				completions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+					&& entry.action.type === ActionType.ChatToolCallComplete
+					&& entry.action.toolCallId === 'tool-call-1').length,
+			}, {
+				resourceReadUris: [firstInputURI.toString(), survivorInputURI.toString()],
+				invocations: [{ callId: 'tool-call-1', parameters: { task: 'survivor' } }],
+				completions: 1,
+			});
+			unresolvedInput.complete({ data: '{"task":"stale"}', encoding: ContentEncoding.Utf8 });
+			await timeout(0);
+			assert.strictEqual(toolsService.invokedToolCalls.length, 1);
+		});
+
+		test('removed unresolved owner without a survivor times out and leaves no permanent reservation', async () => {
+			await runWithFakedTimers({}, async () => {
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const sessionResource = URI.parse('agent-host-copilot:/session-1');
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+				const chatURI = URI.parse(buildDefaultChatUri(backendSession.toString()));
+				const firstInputURI = URI.parse('session-db:/attached-abandoned-input');
+				const laterInputURI = URI.parse('session-db:/attached-later-input');
+				const firstInput = { uri: firstInputURI.toString(), contentType: 'application/json' };
+				const laterInput = { uri: laterInputURI.toString(), contentType: 'application/json' };
+				const unresolvedInput = new DeferredPromise<{ data: string; encoding: ContentEncoding }>();
+				connection.resourceReadResponses.set(firstInputURI.toString(), unresolvedInput.p);
+				connection.resourceReadResponses.set(laterInputURI.toString(), Promise.resolve({
+					data: '{"task":"later"}',
+					encoding: ContentEncoding.Utf8,
+				}));
+
+				applyReferencedRunTask(connection, chatURI, firstInput, ToolCallConfirmationReason.NotNeeded);
+				await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+				applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: firstInput,
+				}, 'running-abandoned');
+				await timeout(0);
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'running-abandoned',
+				});
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+
+				applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: laterInput,
+				}, 'running-later');
+				await timeout(0);
+				await timeout(0);
+
+				assert.deepStrictEqual(toolsService.invokedToolCalls.map(call => call.parameters), [{ task: 'later' }]);
+				unresolvedInput.complete({ data: '{"task":"stale"}', encoding: ContentEncoding.Utf8 });
+				await timeout(0);
+				assert.strictEqual(toolsService.invokedToolCalls.length, 1);
+			});
+		});
+
 		test('attached-session helper executes once without creating an approval', async () => {
 			const invokeResult = new DeferredPromise<IToolResult>();
 			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE));
+			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
 			const sessionResource = URI.parse('agent-host-copilot:/session-1');
 			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
 			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
@@ -2209,43 +2795,202 @@ suite('AgentHostClientTools', () => {
 		});
 
 		test('wrong client cannot use the attached-session handoff', async () => {
-			const invokeResult = new DeferredPromise<IToolResult>();
-			const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
-			disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_RESOURCE));
-			const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
-			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
-				type: ActionType.SessionInputNeededRemoved,
-				id: 'confirmation-tool-call-1',
-			});
-			connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
-				type: ActionType.SessionInputNeededSet,
-				request: {
-					id: 'exec-tool-call-1',
-					kind: SessionInputRequestKind.ToolClientExecution,
-					clientId: 'other-client',
-					chat: chatURI.toString(),
-					turnId: 'turn-1',
-					toolCall: {
-						status: ToolCallStatus.Running,
-						toolCallId: 'tool-call-1',
-						toolName: 'runTask',
-						displayName: 'Run Task',
-						invocationMessage: 'Run Task',
-						toolInput: '{"task":"build"}',
-						confirmed: ToolCallConfirmationReason.UserAction,
-						contributor: { kind: ToolCallContributorKind.Client, clientId: 'other-client' },
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+				connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'confirmation-tool-call-1',
+				});
+				connection.applySessionAction(AgentSession.uri('copilot', 'session-1'), {
+					type: ActionType.SessionInputNeededSet,
+					request: {
+						id: 'exec-tool-call-1',
+						kind: SessionInputRequestKind.ToolClientExecution,
+						clientId: 'other-client',
+						chat: chatURI.toString(),
+						turnId: 'turn-1',
+						toolCall: {
+							status: ToolCallStatus.Running,
+							toolCallId: 'tool-call-1',
+							toolName: 'runTask',
+							displayName: 'Run Task',
+							invocationMessage: 'Run Task',
+							toolInput: '{"task":"build"}',
+							confirmed: ToolCallConfirmationReason.UserAction,
+							contributor: { kind: ToolCallContributorKind.Client, clientId: 'other-client' },
+						},
 					},
-				},
+				});
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, false);
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					completions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallComplete
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, { cancelled: true, completions: 0 });
+				invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
 			});
-			await timeout(0);
-			await timeout(0);
-			assert.deepStrictEqual({
-				cancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
-				completions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+		});
+
+		test('unrelated call and client do not disrupt a delayed exact successor', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'confirmation-tool-call-1',
+				});
+				await timeout(10);
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededSet,
+					request: {
+						id: 'foreign-tool-call-1',
+						kind: SessionInputRequestKind.ToolClientExecution,
+						clientId: 'other-client',
+						chat: chatURI.toString(),
+						turnId: 'turn-1',
+						toolCall: {
+							status: ToolCallStatus.Running,
+							toolCallId: 'tool-call-1',
+							toolName: 'runTask',
+							displayName: 'Run Task',
+							invocationMessage: 'Run Task',
+							toolInput: '{"task":"foreign"}',
+							confirmed: ToolCallConfirmationReason.UserAction,
+							contributor: { kind: ToolCallContributorKind.Client, clientId: 'other-client' },
+						},
+					},
+				});
+				applyRunningClientExecution(connection, chatURI.toString(), 'turn-2', {
+					toolCallId: 'tool-call-2',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"unrelated"}',
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				}, 'unrelated-tool-call-2');
+				await timeout(0);
+				await timeout(0);
+
+				assert.deepStrictEqual({
+					originalCancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					executed: toolsService.executedToolCalls.map(call => call.callId),
+					approvals: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallConfirmed
+						&& entry.action.approved
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, {
+					originalCancelled: false,
+					executed: ['tool-call-2'],
+					approvals: 0,
+				});
+
+				await timeout(10);
+				applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
+					toolCallId: 'tool-call-1',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"build"}',
+					confirmed: ToolCallConfirmationReason.UserAction,
+				}, 'matching-tool-call-1');
+				await timeout(0);
+				await timeout(0);
+				assert.deepStrictEqual({
+					originalCancelled: toolsService.invocationTokens[0]?.isCancellationRequested,
+					executed: toolsService.executedToolCalls.map(call => call.callId),
+					approvals: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallConfirmed
+						&& entry.action.approved
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, {
+					originalCancelled: false,
+					executed: ['tool-call-2', 'tool-call-1'],
+					approvals: 0,
+				});
+
+				invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(connection.dispatchedActions.filter(entry => isChatAction(entry.action)
 					&& entry.action.type === ActionType.ChatToolCallComplete
-					&& entry.action.toolCallId === 'tool-call-1').length,
-			}, { cancelled: true, completions: 0 });
-			invokeResult.complete({ content: [{ kind: 'text', value: 'ignored' }] });
+					&& entry.action.toolCallId === 'tool-call-1').length, 1);
+			});
+		});
+
+		test('unrelated call and client leave the original handoff to time out normally', async () => {
+			await runWithFakedTimers({}, async () => {
+				const invokeResult = new DeferredPromise<IToolResult>();
+				const { handler, connection, toolsService, evaluationSessionAttachmentService } = createHandlerWithMocks(disposables, [testRunTaskTool], { requireConfirmation: true, invokeResult });
+				disposables.add(evaluationSessionAttachmentService.register(EVALUATION_SESSION_IDENTITY));
+				const chatURI = await provideSessionWithPendingConfirmationClientTool(handler, connection);
+				const backendSession = AgentSession.uri('copilot', 'session-1');
+
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededRemoved,
+					id: 'confirmation-tool-call-1',
+				});
+				connection.applySessionAction(backendSession, {
+					type: ActionType.SessionInputNeededSet,
+					request: {
+						id: 'foreign-tool-call-1',
+						kind: SessionInputRequestKind.ToolClientExecution,
+						clientId: 'other-client',
+						chat: chatURI.toString(),
+						turnId: 'turn-1',
+						toolCall: {
+							status: ToolCallStatus.Running,
+							toolCallId: 'tool-call-1',
+							toolName: 'runTask',
+							displayName: 'Run Task',
+							invocationMessage: 'Run Task',
+							toolInput: '{"task":"foreign"}',
+							confirmed: ToolCallConfirmationReason.UserAction,
+							contributor: { kind: ToolCallContributorKind.Client, clientId: 'other-client' },
+						},
+					},
+				});
+				applyRunningClientExecution(connection, chatURI.toString(), 'turn-2', {
+					toolCallId: 'tool-call-2',
+					toolName: 'runTask',
+					displayName: 'Run Task',
+					invocationMessage: 'Run Task',
+					toolInput: '{"task":"unrelated"}',
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				}, 'unrelated-tool-call-2');
+				await timeout(0);
+				await timeout(0);
+				assert.strictEqual(toolsService.invocationTokens[0]?.isCancellationRequested, false);
+
+				await new Promise(resolve => setTimeout(resolve, EVALUATION_CLIENT_TOOL_HANDOFF_GRACE_MS + 1));
+				assert.deepStrictEqual({
+					cancelled: toolsService.invocationTokens.map(token => token.isCancellationRequested),
+					executed: toolsService.executedToolCalls.map(call => call.callId),
+					originalCompletions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallComplete
+						&& entry.action.toolCallId === 'tool-call-1').length,
+					approvals: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
+						&& entry.action.type === ActionType.ChatToolCallConfirmed
+						&& entry.action.approved
+						&& entry.action.toolCallId === 'tool-call-1').length,
+				}, {
+					cancelled: [true, false],
+					executed: ['tool-call-2'],
+					originalCompletions: 0,
+					approvals: 0,
+				});
+				invokeResult.complete({ content: [{ kind: 'text', value: 'done' }] });
+			});
 		});
 
 		test('cancels a confirming client tool when its confirmation request disappears', async () => {
