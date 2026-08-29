@@ -6750,6 +6750,43 @@ suite('AgentSideEffects', () => {
 			assert.deepStrictEqual(sessionInputNeeded(), []);
 		});
 
+		test('approved client tool replaces confirmation with a distinct canonical execution request', () => {
+			setupSession();
+			startTurn('turn-1');
+
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallStart, turnId: 'turn-1',
+				toolCallId: 'tc-client', toolName: 'runTask', displayName: 'Run Task',
+				contributor: { kind: ToolCallContributorKind.Client, clientId: 'client-1' },
+			});
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallReady, turnId: 'turn-1',
+				toolCallId: 'tc-client', invocationMessage: 'Run task', confirmationTitle: 'Run task',
+			});
+
+			const confirmation = sessionInputNeeded()[0];
+			assert.strictEqual(confirmation?.id, `toolConfirmation:${defaultChatUri}:turn-1:tc-client`);
+
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallConfirmed, turnId: 'turn-1',
+				toolCallId: 'tc-client', approved: true, confirmed: ToolCallConfirmationReason.UserAction,
+			});
+
+			const execution = sessionInputNeeded()[0];
+			assert.deepStrictEqual({
+				id: execution?.id,
+				kind: execution?.kind,
+				status: execution?.kind === SessionInputRequestKind.ToolClientExecution ? execution.toolCall.status : undefined,
+				confirmed: execution?.kind === SessionInputRequestKind.ToolClientExecution ? execution.toolCall.confirmed : undefined,
+			}, {
+				id: `toolClientExecution:${defaultChatUri}:turn-1:tc-client`,
+				kind: SessionInputRequestKind.ToolClientExecution,
+				status: ToolCallStatus.Running,
+				confirmed: ToolCallConfirmationReason.UserAction,
+			});
+			assert.notStrictEqual(execution?.id, confirmation?.id);
+		});
+
 		test('auto-approved tool call still surfaces its client execution without flagging input needed', () => {
 			setupSession();
 			startTurn('turn-1');

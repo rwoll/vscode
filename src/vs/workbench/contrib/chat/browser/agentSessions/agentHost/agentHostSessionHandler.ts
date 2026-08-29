@@ -99,6 +99,7 @@ import { IChatWidgetService } from '../../chat.js';
 import { getAgentSessionProviderIcon } from '../agentSessions.js';
 import { IAgentCustomizationScope, IAgentHostActiveClientService } from './agentHostActiveClientService.js';
 import { IAgentHostCustomizationService } from './agentHostCustomizationService.js';
+import { IEvaluationSessionAttachmentService } from './evaluationSessionAttachmentService.js';
 import { IAgentHostSessionWorkingDirectoryResolver } from './agentHostSessionWorkingDirectoryResolver.js';
 import { IAgentHostSessionWorkingDirectorySynchronizer } from './agentHostSessionWorkingDirectorySynchronizer.js';
 import { IAgentHostNewSessionFolderService, computeWorkingDirectories } from './agentHostNewSessionFolderService.js';
@@ -1032,6 +1033,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 	private readonly _renderedRequests = observableValue<ReadonlyMap<string, URI>>(this, new Map());
 	/** Tool calls whose protocol outcome has already been dispatched. */
 	private readonly _resolvedToolCalls = new Set<string>();
+	/** Attached evaluation calls whose approval was already recorded by the protocol driver. */
+	private readonly _externallyPreapprovedToolCalls = new Set<string>();
 	/**
 	 * A single {@link ChatToolInvocation} per client tool call, keyed by
 	 * {@link _toolCallKey}. Created lazily by whichever of the session-level
@@ -1145,6 +1148,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		@IAgentHostCustomizationService private readonly _customizationService: IAgentHostCustomizationService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IWorkbenchAssignmentService assignmentService: IWorkbenchAssignmentService,
+		@IEvaluationSessionAttachmentService private readonly _evaluationSessionAttachmentService: IEvaluationSessionAttachmentService,
 	) {
 		super();
 		this._config = config;
@@ -2511,6 +2515,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			}
 
 			const key = this._toolCallKey(chatURI, initial.turnId, initial.toolCall.toolCallId);
+			if (this._evaluationSessionAttachmentService.isAttached(this._config.connectionAuthority, backendSession)) {
+				if (initial.toolCall.status === ToolCallStatus.PendingConfirmation) {
+					return;
+				}
+				this._externallyPreapprovedToolCalls.add(key);
+				itemStore.add(toDisposable(() => this._externallyPreapprovedToolCalls.delete(key)));
+			}
 			const requestLifecycle = itemStore.add(new MutableDisposable<IDisposable>());
 			itemStore.add(this._retainToolCall(key));
 
@@ -4288,6 +4299,11 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		store.add(autorun(reader => {
 			const state = invocation.state.read(reader);
 			if (confirmationDispatched) {
+				return;
+			}
+			const key = this._toolCallKey(opts.chatURI, opts.turnId, toolCallId);
+			if (this._externallyPreapprovedToolCalls.has(key)) {
+				confirmationDispatched = true;
 				return;
 			}
 			if (state.type === IChatToolInvocation.StateKind.Executing) {
