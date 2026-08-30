@@ -1453,7 +1453,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 						chatTitle = getChatTitle(sessionState, chatURI);
 						const draft = sessionState.draft ?? emptyDraftFromLastTurn(sessionState);
 						draftInputState = this._draftToInputState(sessionResource, draft);
-						if (!sessionState.draft && draft) {
+						if (!sessionState.draft && draft && !this._isEvaluationSessionAttached(resolvedSession)) {
 							this._config.connection.dispatch(chatURI, { type: ActionType.ChatDraftChanged, draft });
 						}
 						const fallbackRawModelId = lastTurnModelSelection(sessionState)?.id;
@@ -1674,7 +1674,9 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			// mapping was ever stored for this session resource.
 			if (chatURI !== undefined) {
 				this._ensurePendingMessageSubscription(sessionResource, resolvedSession);
-				this._ensureDraftSyncSubscription(sessionResource, resolvedSession, chatURI);
+				if (!this._isEvaluationSessionAttached(resolvedSession)) {
+					this._ensureDraftSyncSubscription(sessionResource, resolvedSession, chatURI);
+				}
 			}
 
 			// Eagerly create the snapshot controller once the ChatModel for
@@ -5529,6 +5531,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		} finally {
 			waitStore.dispose();
 		}
+	}
+
+	private _isEvaluationSessionAttached(backendSession: URI): boolean {
+		return this._evaluationSessionAttachmentService.isAttached({
+			connectionAuthority: this._config.connectionAuthority,
+			backendSession,
+		});
 	}
 
 	private _installDraftSync(sessionResource: URI, chatModel: IChatModel, backendSession: URI, chatKey: string, store: DisposableStore): void {
