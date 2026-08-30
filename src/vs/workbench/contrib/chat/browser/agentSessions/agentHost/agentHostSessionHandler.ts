@@ -100,6 +100,7 @@ import { IChatWidgetService } from '../../chat.js';
 import { getAgentSessionProviderIcon } from '../agentSessions.js';
 import { IAgentCustomizationScope, IAgentHostActiveClientService } from './agentHostActiveClientService.js';
 import { IAgentHostCustomizationService } from './agentHostCustomizationService.js';
+import { IEvaluationSessionAttachmentService } from './evaluationSessionAttachmentService.js';
 import { IAgentHostSessionWorkingDirectoryResolver } from './agentHostSessionWorkingDirectoryResolver.js';
 import { IAgentHostSessionWorkingDirectorySynchronizer } from './agentHostSessionWorkingDirectorySynchronizer.js';
 import { IAgentHostNewSessionFolderService, computeWorkingDirectories } from './agentHostNewSessionFolderService.js';
@@ -1146,6 +1147,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		@IAgentHostCustomizationService private readonly _customizationService: IAgentHostCustomizationService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IWorkbenchAssignmentService assignmentService: IWorkbenchAssignmentService,
+		@IEvaluationSessionAttachmentService private readonly _evaluationSessionAttachmentService: IEvaluationSessionAttachmentService,
 	) {
 		super();
 		this._config = config;
@@ -2511,7 +2513,25 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				return;
 			}
 
+			if (this._evaluationSessionAttachmentService.shouldDeferConfirmation({
+				connectionAuthority: this._config.connectionAuthority,
+				backendSession,
+				clientId: this._config.connection.clientId,
+			}, initial)) {
+				return;
+			}
+
 			const key = this._toolCallKey(chatURI, initial.turnId, initial.toolCall.toolCallId);
+			if (initial.toolCall.status === ToolCallStatus.Running
+				&& getClientToolPreApproval(initial.toolCall)
+				&& this._evaluationSessionAttachmentService.isAttached({
+				connectionAuthority: this._config.connectionAuthority,
+				backendSession,
+			})) {
+				const confirmationKey = `${key}\0${ActionType.ChatToolCallConfirmed}`;
+				this._resolvedToolCalls.add(confirmationKey);
+				itemStore.add(toDisposable(() => this._resolvedToolCalls.delete(confirmationKey)));
+			}
 			const requestLifecycle = itemStore.add(new MutableDisposable<IDisposable>());
 			itemStore.add(this._retainToolCall(key));
 
