@@ -12,11 +12,11 @@ import { autorun, IObservable, waitForState } from '../../../../../base/common/o
 import { URI } from '../../../../../base/common/uri.js';
 import { IAgentHostConnectionsService } from '../../../../../platform/agentHost/common/agentHostConnectionsService.js';
 import { findRemoteAgentHostSessionTypeAuthority, isRemoteAgentHostSessionType } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
-import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../../workbench/common/contributions.js';
 import { IEvaluationSessionAttachmentService, IEvaluationSessionIdentity } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/evaluationSessionAttachmentService.js';
+import { IWorkbenchEnvironmentService } from '../../../../../workbench/services/environment/common/environmentService.js';
 import { ISession } from '../../../../services/sessions/common/session.js';
 import { ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
@@ -210,14 +210,12 @@ export class EvaluationSessionAttachmentContribution extends Disposable implemen
 	private readonly _attachment = this._register(new MutableDisposable<IDisposable>());
 
 	constructor(
-		@IEnvironmentService environmentService: IEnvironmentService,
+		@IWorkbenchEnvironmentService environmentService: IWorkbenchEnvironmentService,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@INotificationService notificationService: INotificationService,
 	) {
 		super();
-		const value = (environmentService as IEnvironmentService & {
-			readonly args: { readonly 'attach-to-evaluation-session'?: string };
-		}).args['attach-to-evaluation-session'];
+		const value = environmentService.args['attach-to-evaluation-session'];
 		if (value === undefined) {
 			return;
 		}
